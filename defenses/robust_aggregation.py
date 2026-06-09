@@ -25,6 +25,8 @@ def krum_aggregate(client_weights, num_malicious=1):
     def distance(w1, w2):
         total = 0.0
         for key in w1.keys():
+            if w1[key].dtype == torch.long:
+                continue
             diff = w1[key].float() - w2[key].float()
             total += torch.norm(diff).item() ** 2
         return total ** 0.5
@@ -47,17 +49,19 @@ def krum_aggregate(client_weights, num_malicious=1):
     best_idx = min(scores, key=lambda x: x[1])[0]
     return copy.deepcopy(client_weights[best_idx])
 
-
 def trimmed_mean_aggregate(client_weights, trim_ratio=0.2):
     """Trimmed mean: remove largest and smallest values per layer."""
     if not client_weights:
         return None
     
     num_clients = len(client_weights)
-    trim_count = int(num_clients * trim_ratio)
+    trim_count = max(1, int(num_clients * trim_ratio))
     
     avg_weights = copy.deepcopy(client_weights[0])
     for key in avg_weights.keys():
+        if avg_weights[key].dtype == torch.long:
+            continue
+            
         # Collect all values for this layer
         values = torch.stack([w[key].float() for w in client_weights], dim=0)
         # Sort and trim
@@ -68,11 +72,15 @@ def trimmed_mean_aggregate(client_weights, trim_ratio=0.2):
     
     return avg_weights
 
-
 def fedavg_aggregate(client_weights):
     """Standard FedAvg."""
+    if not client_weights:
+        return None
+        
     avg = copy.deepcopy(client_weights[0])
     for key in avg.keys():
+        if avg[key].dtype == torch.long:
+            continue
         for w in client_weights[1:]:
             avg[key] += w[key]
         avg[key] = avg[key] / len(client_weights)
