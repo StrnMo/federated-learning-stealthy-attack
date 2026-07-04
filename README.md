@@ -55,34 +55,29 @@ Round 30: FedAvg (7%) vs Trimmed Mean (85%) vs Krum (69%)
 
 ## Repository Structure
 
+```
 federated-learning-stealthy-attack/
-│
 ├── attacks/
-│ ├── __init__.py
-│ └── baruch_attack.py # Baruch 2019 model poisoning
-│
+│   ├── __init__.py
+│   └── baruch_attack.py          # Baruch 2019 model poisoning
 ├── defenses/
-│ ├── __init__.py
-│ └── aggregation.py # FedAvg, Trimmed Mean, Krum
-│
+│   ├── __init__.py
+│   └── aggregation.py            # FedAvg, Trimmed Mean, Krum
 ├── models/
-│ ├── __init__.py
-│ └── cnn_model.py # CNN for BloodMNIST (3×28×28 → 8 classes)
-│
+│   ├── __init__.py
+│   └── cnn_model.py              # CNN for BloodMNIST (3×28×28 → 8 classes)
 ├── utils/
-│ ├── __init__.py
-│ ├── data_utils.py # Data loading, non-IID splits
-│ └── metrics.py # Stealthiness, accuracy evaluation
-│
+│   ├── __init__.py
+│   ├── data_utils.py             # Data loading, non-IID splits
+│   └── metrics.py                # Stealthiness, accuracy evaluation
 ├── experiments/
-│ ├── run_experiment.py # Main experiment script
-│ └── complete_defenses.py # Defense comparison runner
-│
+│   ├── run_experiment.py         # Main experiment script
+│   └── complete_defenses.py      # Defense comparison runner
 ├── plots/
-│ └── final_defense_results.png
-│
+│   └── final_defense_results.png
 ├── requirements.txt
 └── README.md
+```
 
 
 ## 🚀 Quick Start
