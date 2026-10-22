@@ -220,7 +220,7 @@ def test_every_defense_has_a_no_attack_control():
     assert EXISTING_CONFIG_NAMES <= set(names)
 
 def fake_run(seed, accuracy=0.8, status='valid', nonfinite_from_round=None, rounds=3,
-             client_sizes=None, malicious_ids=(0, 1, 2, 3)):
+             client_sizes=None, malicious_ids=(0, 1, 2, 3), balanced_accuracy=None):
     """Minimal saved-run dict, as loaded from a result JSON"""
     cm = np.zeros((8, 8), dtype=int)
     if status == 'valid':
@@ -230,6 +230,8 @@ def fake_run(seed, accuracy=0.8, status='valid', nonfinite_from_round=None, roun
         cm[:, 0] = 10  # every prediction in class 0 (what argmax of NaN rows also gives)
     test = {**classification_metrics(cm), 'accuracy': accuracy, 'confusion_matrix': cm.tolist(),
             'nonfinite_samples': 3421 if status == 'diverged' else 0}
+    if balanced_accuracy is not None:
+        test['balanced_accuracy'] = balanced_accuracy
     history = [{'round': r, 'val_accuracy': accuracy, 'val_balanced_accuracy': accuracy,
                 'val_nonfinite_samples': 1712 if nonfinite_from_round and r >= nonfinite_from_round else 0,
                 'kept_clients': None, 'detection': None} for r in range(1, rounds + 1)]
@@ -280,6 +282,31 @@ def test_plot_and_summary_handle_fully_excluded_configs(tmp_path, capsys):
     out = capsys.readouterr().out
     assert '— [0/3 valid: 3 diverged]' in out and 'seed 2: diverged' in out
     assert 'Per-seed results (FedAvg' in out and '20.0%' in out
+
+def test_single_valid_seed_has_no_std():
+    s = rx.summarise([fake_run(0, 0.7), fake_run(1, status='diverged'), fake_run(2, status='diverged')])
+    assert s['test_accuracy'] == {'mean': 0.7, 'std': None}
+    assert rx.format_metric(s['test_accuracy'], s) == '0.7000 ± n/a [1/3 valid: 2 diverged]'
+    assert np.isnan(rx.mean_or_nan(s['test_accuracy'], 'std'))  # no error bar in the plot
+
+def test_main_metric_counts_broken_runs_at_chance():
+    # Broken runs' stored balanced accuracy is irrelevant: they count as 1/num_classes
+    runs = [fake_run(0, balanced_accuracy=0.8),
+            fake_run(1, status='diverged', balanced_accuracy=float('nan')),
+            fake_run(2, status='degenerate', balanced_accuracy=0.3)]
+    s = rx.summarise(runs)
+    assert s['chance_level'] == 1 / 8
+    assert s['test_balanced_accuracy_all_seeds']['mean'] == pytest.approx((0.8 + 2 / 8) / 3)
+    assert s['test_balanced_accuracy']['mean'] == 0.8  # valid-only mean, secondary
+
+def test_main_metric_on_colab_fedavg_z2_results():
+    # FedAvg z=2.0 on Colab: seed 3 survived with balanced accuracy 0.6182, four seeds diverged
+    runs = [fake_run(3, accuracy=0.7179, balanced_accuracy=0.6182)]
+    runs += [fake_run(seed, accuracy=0.0713, status='diverged') for seed in (0, 1, 2, 4)]
+    s = rx.summarise(runs)
+    assert s['test_balanced_accuracy_all_seeds']['mean'] == pytest.approx(0.2236, abs=1e-4)
+    assert rx.format_metric(s['test_balanced_accuracy_all_seeds'], s).startswith('0.2236 ± ')
+    assert rx.format_metric(s['test_balanced_accuracy'], s) == '0.6182 ± n/a [1/5 valid: 4 diverged]'
 
 def test_attacker_data_share_is_their_fedavg_weight():
     # Clients 0-3 attack; client 19 has too few samples and does not participate

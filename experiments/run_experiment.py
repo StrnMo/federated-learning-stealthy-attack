@@ -188,8 +188,9 @@ def mean_detection(run, key):
     return float(np.mean(values)) if values else None
 
 def mean_std(values):
+    """Mean and sample std; std is None (shown as "± n/a") with fewer than 2 values"""
     return {'mean': float(np.mean(values)),
-            'std': float(np.std(values, ddof=1)) if len(values) > 1 else 0.0}
+            'std': float(np.std(values, ddof=1)) if len(values) > 1 else None}
 
 def run_status(run):
     """
@@ -247,6 +248,12 @@ def summarise(runs):
         return mean_std(values) if values else None
     summary['test_accuracy'] = stat([r['test']['accuracy'] for r in valid])
     summary['test_balanced_accuracy'] = stat([r['test']['balanced_accuracy'] for r in valid])
+    # Main metric: every seed counts; diverged/degenerate runs score chance level, so a
+    # collapse is not hidden by averaging only the seeds that survived
+    summary['chance_level'] = 1.0 / len(runs[0]['test']['confusion_matrix'])
+    summary['test_balanced_accuracy_all_seeds'] = mean_std(
+        [r['test']['balanced_accuracy'] if status == 'valid' else summary['chance_level']
+         for r, status in zip(runs, statuses)])
     summary['test_per_class_recall_mean'] = (np.nanmean(
         [[np.nan if v is None else v for v in r['test']['per_class_recall']] for r in valid],
         axis=0).tolist() if valid else None)
@@ -265,11 +272,16 @@ def counts_label(s):
 
 def format_metric(m, s, digits=4):
     """A mean ± std with the counts it was computed over; '—' when no run is valid"""
-    value = '—' if m is None else f"{m['mean']:.{digits}f} ± {m['std']:.{digits}f}"
+    if m is None:
+        value = '—'
+    else:
+        std = 'n/a' if m['std'] is None else f"{m['std']:.{digits}f}"
+        value = f"{m['mean']:.{digits}f} ± {std}"
     return f"{value} {counts_label(s)}"
 
 def mean_or_nan(m, key='mean'):
-    return np.nan if m is None else m[key]
+    value = None if m is None else m[key]
+    return np.nan if value is None else value
 
 def plot_curve(ax, runs, label, style):
     """Mean validation accuracy per round with a ±1 std band over the valid seeds"""
@@ -301,21 +313,26 @@ def plot_results(runs, stats, plots_dir):
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
     baseline = stats[BASELINE['name']]
-    baseline_acc = baseline['test_accuracy']
-    baseline_label = f"Baseline: {format_metric(baseline_acc, baseline, digits=3)}"
+    main = 'test_balanced_accuracy_all_seeds'
+    baseline_main = baseline[main]
+    baseline_label = f"Baseline: {format_metric(baseline_main, baseline, digits=3)}"
     attack_stats = [stats[s['name']] for s in ATTACK_SWEEP]
 
-    # Plot 1: Accuracy vs Attack Strength (valid seeds only; counts under each point)
-    for metric, fmt, label in [('test_accuracy', 'ro-', 'FedAvg accuracy'),
-                               ('test_balanced_accuracy', 'm^--', 'FedAvg balanced accuracy')]:
+    # Plot 1: Accuracy vs Attack Strength. Main metric over all seeds (broken runs = chance);
+    # valid-only means as secondary lines; counts under each point
+    for metric, fmt, label, alpha in [
+            (main, 'ko-', 'Balanced acc., all seeds (broken = chance)', 1.0),
+            ('test_accuracy', 'r^--', 'Accuracy, valid seeds only', 0.5),
+            ('test_balanced_accuracy', 'mv:', 'Balanced acc., valid seeds only', 0.5)]:
         axes[0, 0].errorbar(ATTACK_STRENGTHS, [mean_or_nan(s[metric]) for s in attack_stats],
                             yerr=[mean_or_nan(s[metric], 'std') for s in attack_stats],
-                            fmt=fmt, linewidth=2, markersize=8, capsize=4, label=label)
-    if baseline_acc is not None:
-        axes[0, 0].axhline(y=baseline_acc['mean'], color='g', linestyle='--', label=baseline_label)
+                            fmt=fmt, linewidth=2, markersize=8, capsize=4, label=label, alpha=alpha)
+    axes[0, 0].axhline(y=baseline_main['mean'], color='g', linestyle='--', label=baseline_label)
+    axes[0, 0].axhline(y=baseline['chance_level'], color='gray', linestyle=':',
+                       label=f"Chance ({baseline['chance_level']:.3f})")
     annotate_counts(axes[0, 0], ATTACK_STRENGTHS, attack_stats)
     axes[0, 0].set_xlabel('Attack Strength (z)')
-    axes[0, 0].set_ylabel('Final Test Accuracy')
+    axes[0, 0].set_ylabel('Final Test Metric (FedAvg)')
     axes[0, 0].set_title('Model Accuracy vs Attack Strength')
     axes[0, 0].legend()
     axes[0, 0].grid(True, alpha=0.3)
@@ -336,20 +353,20 @@ def plot_results(runs, stats, plots_dir):
     for offset, idx, label, color in [(-width / 2, 0, 'No attack', 'tab:green'),
                                       (width / 2, 1, f'Attack z={DEFENSE_ATTACK_STRENGTH}', 'tab:red')]:
         pair_stats = [stats[pair[idx]['name']] for pair in DEFENSE_PAIRS]
-        accs = [s['test_accuracy'] for s in pair_stats]
+        accs = [s[main] for s in pair_stats]
         bars = axes[1, 0].bar(x + offset, [mean_or_nan(a) for a in accs], width,
                               yerr=[mean_or_nan(a, 'std') for a in accs], capsize=4, color=color,
                               label=label)
         for bar, a, s in zip(bars, accs, pair_stats):
             counts = f"{s['num_valid']}/{s['num_seeds']}"
             text = f"{counts} valid" if a is None else f"{a['mean']:.3f}\n[{counts}]"
-            height = 0.0 if a is None else a['mean'] + a['std']
+            height = 0.0 if a is None else a['mean'] + (a['std'] or 0.0)
             axes[1, 0].text(bar.get_x() + bar.get_width()/2, height + 0.01, text, ha='center',
                             fontsize=8, color='black' if s['num_valid'] == s['num_seeds'] else 'red')
     axes[1, 0].set_xticks(x, [DEFENSE_LABELS[attacked['defense']['name']]
                               for _, attacked in DEFENSE_PAIRS])
     axes[1, 0].set_ylim(0, 1.15)  # room for the value/count labels above the bars
-    axes[1, 0].set_ylabel('Test Accuracy')
+    axes[1, 0].set_ylabel('Balanced acc., all seeds (broken = chance)')
     axes[1, 0].set_title('Defense Effectiveness (with and without attack)')
     axes[1, 0].legend()
     axes[1, 0].grid(True, alpha=0.3, axis='y')
@@ -364,27 +381,31 @@ def plot_results(runs, stats, plots_dir):
     axes[1, 1].legend()
     axes[1, 1].grid(True, alpha=0.3)
 
-    plt.suptitle(f'Naive Reversed/Scaled Poisoning Attack: mean ± std over valid seeds '
-                 f'(of {baseline["num_seeds"]}; diverged/degenerate runs excluded)', fontsize=14)
+    plt.suptitle(f'Naive Reversed/Scaled Poisoning Attack ({baseline["num_seeds"]} seeds): main metric '
+                 f'= balanced acc. over all seeds, diverged/degenerate runs at chance', fontsize=14)
     plt.tight_layout()
     os.makedirs(plots_dir, exist_ok=True)
     plt.savefig(os.path.join(plots_dir, 'experiment_results.png'), dpi=150, bbox_inches='tight')
     plt.close()
 
 def print_summary(stats, results_dir, plots_dir):
+    main = 'test_balanced_accuracy_all_seeds'
     baseline = stats[BASELINE['name']]
     print("\n" + "=" * 70)
-    print("EXPERIMENT SUMMARY (test split, mean ± std over valid seeds)")
-    print("Diverged (non-finite outputs) and degenerate (single predicted class) runs are")
-    print("excluded from every mean; [v/n valid] gives the seeds behind each mean.")
+    print("EXPERIMENT SUMMARY (test split)")
+    print("Main metric 'main': balanced accuracy over ALL seeds, where diverged (non-finite")
+    print("outputs) and degenerate (single predicted class) runs count as chance level.")
+    print("'valid only' means exclude those runs. [v/n valid] gives the seeds behind each value.")
     print("=" * 70)
     print(f"Configuration: {NUM_CLIENTS} clients, {NUM_MALICIOUS} malicious, seeds {baseline['seeds']}")
-    print(f"Baseline (No Attack): acc {format_metric(baseline['test_accuracy'], baseline)}, "
+    print(f"Baseline (No Attack): main {format_metric(baseline[main], baseline)}; valid only: "
+          f"acc {format_metric(baseline['test_accuracy'], baseline)}, "
           f"balanced {format_metric(baseline['test_balanced_accuracy'], baseline)}")
     print("\nAttack Strength Results (FedAvg):")
     for spec, z in zip(ATTACK_SWEEP, ATTACK_STRENGTHS):
         s = stats[spec['name']]
-        print(f"  z={z}: acc {format_metric(s['test_accuracy'], s)}, "
+        print(f"  z={z}: main {format_metric(s[main], s)}; valid only: "
+              f"acc {format_metric(s['test_accuracy'], s)}, "
               f"balanced {format_metric(s['test_balanced_accuracy'], s)}, "
               f"magnitude {format_metric(s['stealthiness'], s, digits=2)}")
     print(f"\nDefense Results (no attack vs. attack z={DEFENSE_ATTACK_STRENGTH}):")
@@ -392,7 +413,8 @@ def print_summary(stats, results_dir, plots_dir):
         print(f"  {DEFENSE_LABELS[attacked['defense']['name']]}:")
         for tag, spec in [('no attack', control), ('attack', attacked)]:
             s = stats[spec['name']]
-            line = (f"    {tag:<10} acc {format_metric(s['test_accuracy'], s)}, "
+            line = (f"    {tag:<10} main {format_metric(s[main], s)}; valid only: "
+                    f"acc {format_metric(s['test_accuracy'], s)}, "
                     f"balanced {format_metric(s['test_balanced_accuracy'], s)}")
             if s['detection_tpr'] is not None:
                 line += f", detection TPR {format_metric(s['detection_tpr'], s)}"
