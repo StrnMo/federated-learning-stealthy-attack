@@ -62,6 +62,22 @@ def test_same_seed_gives_same_partition_across_configs(short_runs):
 def test_different_seed_gives_different_partition(short_runs):
     assert short_runs['c']['client_sizes'] != short_runs['d']['client_sizes']
 
+def test_server_side_tensors_are_on_cpu(monkeypatch):
+    # Client updates live on CPU, so a CUDA global state would crash the attack and aggregation.
+    # Only catches a regression when CUDA is available; on CPU-only machines it passes trivially.
+    devices = set()
+    def record(*dicts):
+        for d in dicts:
+            devices.update(v.device.type for v in d.values())
+
+    real_attack, real_fedavg = rx.baruch_attack, rx.fedavg_aggregate
+    monkeypatch.setattr(rx, 'baruch_attack',
+                        lambda g, w, z: (record(g, w), real_attack(g, w, z))[1])
+    monkeypatch.setattr(rx, 'fedavg_aggregate',
+                        lambda ws: (record(*ws), real_fedavg(ws))[1])
+    rx.run_experiment(3.0, 'fedavg', seed=0, num_rounds=1)
+    assert devices == {'cpu'}
+
 def test_pipeline_writes_results(tmp_path, monkeypatch):
     monkeypatch.setattr(rx, 'RESULTS_DIR', str(tmp_path / 'results'))
     monkeypatch.setattr(rx, 'PLOTS_DIR', str(tmp_path / 'plots'))

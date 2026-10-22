@@ -77,9 +77,9 @@ def run_experiment(attack_strength, defense='fedavg', seed=0, num_rounds=NUM_ROU
     actual_malicious = min(NUM_MALICIOUS, max(2, num_valid_clients // 5))
     print(f"  Malicious clients: {actual_malicious}")
 
-    # Initialize global model
+    # Initialize global model; the server keeps its weights on CPU, like the client updates
     global_model = copy.deepcopy(base_model)
-    global_weights = global_model.state_dict()
+    global_weights = {k: v.cpu().clone() for k, v in global_model.state_dict().items()}
 
     accuracies = []
     stealthiness_scores = []
