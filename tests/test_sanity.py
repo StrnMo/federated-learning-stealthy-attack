@@ -179,6 +179,22 @@ def test_environment_info_records_device():
     assert info['device'] == 'cpu' and info['gpu'] is None
     assert info['torch'] == torch.__version__
 
+# Configurations already run on Colab; renaming them would orphan the saved results
+EXISTING_CONFIG_NAMES = {
+    'fedavg_no_attack', 'fedavg_reversed_scaled_z1.5', 'fedavg_reversed_scaled_z2.0',
+    'fedavg_reversed_scaled_z3.0', 'fedavg_reversed_scaled_z5.0',
+    'trimmed_mean_reversed_scaled_z3.0', 'krum_reversed_scaled_z3.0',
+}
+
+def test_every_defense_has_a_no_attack_control():
+    for control, attacked in rx.DEFENSE_PAIRS:
+        assert control['attack'] is None and attacked['attack'] is not None
+        assert control['defense'] == attacked['defense']
+    names = [s['name'] for s in rx.CONFIGS]
+    assert len(names) == len(set(names))
+    assert {'trimmed_mean_no_attack', 'krum_no_attack'} <= set(names)
+    assert EXISTING_CONFIG_NAMES <= set(names)
+
 # ---------- End-to-end checks on BloodMNIST (short runs) ----------
 
 @pytest.fixture(scope='module')

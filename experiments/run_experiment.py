@@ -55,10 +55,16 @@ ATTACK_SWEEP = [make_spec('fedavg', z) for z in ATTACK_STRENGTHS]
 DEFENSE_COMPARISON = [make_spec('fedavg', DEFENSE_ATTACK_STRENGTH),
                       make_spec('trimmed_mean', DEFENSE_ATTACK_STRENGTH, trim_ratio=0.2),
                       make_spec('krum', DEFENSE_ATTACK_STRENGTH)]  # Krum f = true #malicious
+# Each defense also runs without attack, to separate the defense's own cost from the attack's effect
+DEFENSE_CONTROLS = [BASELINE,
+                    make_spec('trimmed_mean', trim_ratio=0.2),
+                    make_spec('krum')]
+DEFENSE_PAIRS = list(zip(DEFENSE_CONTROLS, DEFENSE_COMPARISON))  # (no attack, under attack)
 DEFENSE_LABELS = {'fedavg': 'FedAvg (No Defense)', 'trimmed_mean': 'Trimmed Mean', 'krum': 'Krum'}
 
 # Every distinct spec is run once per seed (FedAvg at z=3 is shared by sweep and comparison)
-CONFIGS = list({s['name']: s for s in [BASELINE] + ATTACK_SWEEP + DEFENSE_COMPARISON}.values())
+CONFIGS = list({s['name']: s for s in [BASELINE] + ATTACK_SWEEP + DEFENSE_COMPARISON
+                + DEFENSE_CONTROLS}.values())
 
 def run_experiment(spec, seed=0, num_rounds=NUM_ROUNDS):
     """
@@ -236,24 +242,24 @@ def plot_results(runs, stats, plots_dir):
     axes[0, 1].set_title('Stealthiness (Lower = Harder to Detect)')
     axes[0, 1].grid(True, alpha=0.3)
 
-    # Plot 3: Defense Comparison
-    defense_names = [DEFENSE_LABELS[s['defense']['name']] for s in DEFENSE_COMPARISON]
-    defense_stats = [stats[s['name']] for s in DEFENSE_COMPARISON]
-    defense_means = [s['test_accuracy']['mean'] for s in defense_stats]
-    defense_stds = [s['test_accuracy']['std'] for s in defense_stats]
-    bars = axes[1, 0].bar(defense_names, defense_means, yerr=defense_stds, capsize=6,
-                          color=['red', 'blue', 'green'])
-    axes[1, 0].axhline(y=baseline_acc['mean'], color='black', linestyle='--',
-                       label=baseline_label)
+    # Plot 3: Defense Comparison, each defense without and with attack
+    x = np.arange(len(DEFENSE_PAIRS))
+    width = 0.38
+    for offset, idx, label, color in [(-width / 2, 0, 'No attack', 'tab:green'),
+                                      (width / 2, 1, f'Attack z={DEFENSE_ATTACK_STRENGTH}', 'tab:red')]:
+        accs = [stats[pair[idx]['name']]['test_accuracy'] for pair in DEFENSE_PAIRS]
+        bars = axes[1, 0].bar(x + offset, [a['mean'] for a in accs], width,
+                              yerr=[a['std'] for a in accs], capsize=4, color=color, label=label)
+        for bar, a in zip(bars, accs):
+            axes[1, 0].text(bar.get_x() + bar.get_width()/2, bar.get_height() + a['std'] + 0.01,
+                           f"{a['mean']:.3f}", ha='center', fontsize=9)
+    axes[1, 0].set_xticks(x, [DEFENSE_LABELS[attacked['defense']['name']]
+                              for _, attacked in DEFENSE_PAIRS])
     axes[1, 0].set_ylabel('Test Accuracy')
-    axes[1, 0].set_title(f'Defense Effectiveness (Attack Strength = {DEFENSE_ATTACK_STRENGTH})')
+    axes[1, 0].set_title('Defense Effectiveness (with and without attack)')
     axes[1, 0].legend()
     axes[1, 0].grid(True, alpha=0.3, axis='y')
-
-    for bar, mean, std in zip(bars, defense_means, defense_stds):
-        axes[1, 0].text(bar.get_x() + bar.get_width()/2, bar.get_height() + std + 0.01,
-                       f'{mean:.3f}', ha='center', fontsize=9)
-
+    
     # Plot 4: Training Progress
     for s, strength in zip(ATTACK_SWEEP[:3], ATTACK_STRENGTHS[:3]):
         plot_curve(axes[1, 1], runs[s['name']], f'z={strength}', '-')
@@ -290,16 +296,19 @@ def print_summary(stats, results_dir, plots_dir):
         s = stats[spec['name']]
         print(f"z={z:<8} {fmt(s['test_accuracy']):<20} {fmt(s['test_balanced_accuracy']):<20} "
               f"{s['stealthiness']['mean']:.2f} ± {s['stealthiness']['std']:.2f}")
-    print(f"\nDefense Results (Attack Strength = {DEFENSE_ATTACK_STRENGTH}):")
-    for spec in DEFENSE_COMPARISON:
-        s = stats[spec['name']]
-        label = DEFENSE_LABELS[spec['defense']['name']] + ':'
-        line = (f"  {label:<22}acc {fmt(s['test_accuracy'])}, "
-                f"balanced {fmt(s['test_balanced_accuracy'])}")
-        if s['detection_tpr'] is not None:
-            line += (f", detection TPR {fmt(s['detection_tpr'])}"
-                     f", FPR {fmt(s['detection_fpr'])}")
-        print(line)
+    print(f"\nDefense Results (no attack vs. attack z={DEFENSE_ATTACK_STRENGTH}):")
+    for control, attacked in DEFENSE_PAIRS:
+        print(f"  {DEFENSE_LABELS[attacked['defense']['name']]}:")
+        for tag, spec in [('no attack', control), ('attack', attacked)]:
+            s = stats[spec['name']]
+            line = (f"    {tag:<10} acc {fmt(s['test_accuracy'])}, "
+                    f"balanced {fmt(s['test_balanced_accuracy'])}")
+            if s['detection_tpr'] is not None:
+                line += (f", detection TPR {fmt(s['detection_tpr'])}"
+                         f", FPR {fmt(s['detection_fpr'])}")
+            elif s['detection_fpr'] is not None:
+                line += f", detection FPR {fmt(s['detection_fpr'])}"
+            print(line)
     nonfinite = sum(s['test_nonfinite_samples'] for s in stats.values())
     if nonfinite:
         print(f"\nWARNING: {nonfinite} test predictions came from non-finite logits")
