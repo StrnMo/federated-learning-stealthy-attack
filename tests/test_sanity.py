@@ -16,7 +16,7 @@ sys.path.insert(0, REPO_ROOT)
 sys.path.insert(0, os.path.join(REPO_ROOT, 'experiments'))
 
 from attacks.baruch_attack import baruch_attack
-from defenses.aggregation import fedavg_aggregate, trimmed_mean_aggregate, krum_aggregate
+from defenses.aggregation import fedavg_aggregate, trimmed_mean_aggregate, krum_aggregate, krum_scores
 from models.cnn_model import get_model
 from utils.data_utils import FLClient
 import run_experiment as rx
@@ -52,6 +52,19 @@ def test_krum_rejects_outliers():
     clients += [weights(100.0), weights(100.0)]
     agg = krum_aggregate(clients, num_malicious=2)
     assert abs(agg['w'].item()) < 1.0
+
+# n=6, f=1: plain-distance Krum would pick client 2, squared-distance Krum picks client 0
+KRUM_POINTS = [(-5, 0), (-5, -5), (-5, -4), (2, -1), (2, 2), (-4, 5)]
+
+def test_krum_uses_squared_distances():
+    clients = [weights(float(x), float(y)) for x, y in KRUM_POINTS]
+    assert krum_scores(clients, num_malicious=1).tolist() == [67, 91, 75, 117, 107, 143]
+    assert torch.equal(krum_aggregate(clients, num_malicious=1)['w'], torch.tensor([-5.0, 0.0]))
+
+def test_krum_rejects_too_many_attackers():
+    # n must exceed 2f + 2; previously this silently fell back to trimmed mean
+    with pytest.raises(ValueError):
+        krum_aggregate([weights(float(v)) for v in range(6)], num_malicious=2)
 
 def test_model_state_is_only_trainable_parameters():
     # No normalisation buffers that could be averaged across clients or flipped by an attack
