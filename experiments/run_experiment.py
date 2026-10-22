@@ -18,7 +18,7 @@ from attacks import apply_attack
 from defenses.aggregation import aggregate
 from utils.data_utils import load_data, partition_data, FLClient, DEVICE
 from utils.metrics import compute_stealthiness, evaluate, detection_rates
-from utils.reproducibility import set_seed, get_git_info, save_results
+from utils.reproducibility import set_seed, get_git_info, get_environment_info, save_results
 
 # Experiment Configuration
 NUM_CLIENTS = 20
@@ -321,6 +321,7 @@ def build_config(args):
         'evaluation': 'validation split every round; test split once after the final round',
         'detection': 'clients a defense did not keep count as flagged (Krum keeps one)',
         'seeds': args.seeds,
+        'environment': get_environment_info(DEVICE),
         'git': get_git_info()
     }
 
@@ -340,7 +341,7 @@ def main():
     print("=" * 70)
     print("MODEL POISONING ATTACK EXPERIMENT")
     print(f"Clients: {NUM_CLIENTS}, Malicious: {NUM_MALICIOUS}, Rounds: {args.rounds}, "
-          f"Seeds: {args.seeds}")
+          f"Seeds: {args.seeds}, Device: {config['environment']['device']}")
     print("=" * 70)
 
     runs = {spec['name']: [] for spec in CONFIGS}

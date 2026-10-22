@@ -161,6 +161,24 @@ def test_detection_rates():
     assert detection_rates([7], participants, set()) == {'tpr': None, 'fpr': 19 / 20}
     assert detection_rates(None, participants, malicious) is None
 
+def test_device_is_gpu_when_available():
+    from utils.data_utils import DEVICE
+    assert DEVICE.type == ('cuda' if torch.cuda.is_available() else 'cpu')
+
+def test_data_root_follows_environment_variable(tmp_path):
+    import subprocess
+    code = "from utils.data_utils import DATA_ROOT; print(DATA_ROOT)"
+    env = {**os.environ, 'MEDMNIST_ROOT': str(tmp_path)}
+    out = subprocess.run([sys.executable, '-c', code], cwd=REPO_ROOT, env=env,
+                         capture_output=True, text=True, check=True).stdout.strip().splitlines()
+    assert out[-1] == str(tmp_path)
+
+def test_environment_info_records_device():
+    from utils.reproducibility import get_environment_info
+    info = get_environment_info(torch.device('cpu'))
+    assert info['device'] == 'cpu' and info['gpu'] is None
+    assert info['torch'] == torch.__version__
+
 # ---------- End-to-end checks on BloodMNIST (short runs) ----------
 
 @pytest.fixture(scope='module')

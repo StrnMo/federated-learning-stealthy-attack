@@ -34,6 +34,21 @@ def get_git_info():
         return {'commit': 'unknown', 'dirty': None}
     return {'commit': commit, 'dirty': bool(status)}
 
+def get_environment_info(device):
+    """Device and library versions, recorded with every result"""
+    import platform
+    import medmnist
+    info = {
+        'device': str(device),
+        'gpu': torch.cuda.get_device_name(device) if device.type == 'cuda' else None,
+        'python': platform.python_version(),
+        'torch': torch.__version__,
+        'cuda': torch.version.cuda,
+        'numpy': np.__version__,
+        'medmnist': medmnist.__version__,
+    }
+    return info
+
 def save_results(path, results):
     """Write a results dict to a JSON file, creating the directory if needed"""
     os.makedirs(os.path.dirname(path), exist_ok=True)

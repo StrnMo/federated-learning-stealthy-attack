@@ -10,7 +10,8 @@ from torch.utils.data import DataLoader, Subset
 from medmnist import BloodMNIST, INFO
 
 # Configuration
-DATA_ROOT = 'C:/Users/ASUS/.medmnist'
+DATA_ROOT = os.environ.get('MEDMNIST_ROOT', os.path.expanduser('~/.medmnist'))
+# GPU when available, otherwise CPU
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 BATCH_SIZE = 32
 
