@@ -16,7 +16,7 @@ from torch.utils.data import Subset, DataLoader
 from medmnist import BloodMNIST, INFO
 
 from models.cnn_model import get_model
-from attacks.baruch_attack import baruch_attack
+from attacks.reversed_scaled_attack import reversed_scaled_attack
 from defenses.aggregation import fedavg_aggregate, trimmed_mean_aggregate, krum_aggregate
 from utils.metrics import evaluate_model
 
@@ -152,8 +152,8 @@ def run_defense_experiment(defense_name, defense_func):
                 continue
             is_malicious = (i < actual_malicious)
             if is_malicious:
-                from attacks.baruch_attack import baruch_attack
-                poisoned = baruch_attack(global_weights, honest_weights, ATTACK_STRENGTH)
+                from attacks.reversed_scaled_attack import reversed_scaled_attack
+                poisoned = reversed_scaled_attack(global_weights, honest_weights, ATTACK_STRENGTH)
                 client_weights.append(poisoned)
             else:
                 client_weights.append(honest_weights)

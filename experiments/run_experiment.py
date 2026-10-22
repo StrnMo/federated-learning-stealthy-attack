@@ -1,5 +1,5 @@
 """
-Main experiment script for stealthy model poisoning attacks
+Main experiment script: model poisoning attacks vs. robust aggregation in FL
 """
 
 import sys
@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 from torch.utils.data import Subset
 
 from models.cnn_model import get_model
-from attacks.baruch_attack import baruch_attack
+from attacks.reversed_scaled_attack import reversed_scaled_attack
 from defenses.aggregation import fedavg_aggregate, trimmed_mean_aggregate, krum_aggregate
 from utils.data_utils import load_data, create_non_iid_splits, FLClient, DEVICE
 from utils.metrics import compute_stealthiness, evaluate_model
@@ -108,7 +108,7 @@ def run_experiment(attack_strength, defense='fedavg', seed=0, num_rounds=NUM_ROU
             is_malicious = (i < actual_malicious and attack_strength > 1.0)
 
             if is_malicious:
-                poisoned = baruch_attack(global_weights, honest_weights, attack_strength)
+                poisoned = reversed_scaled_attack(global_weights, honest_weights, attack_strength)
                 client_weights.append(poisoned)
                 stealthiness_scores.append(compute_stealthiness(global_weights, poisoned))
             else:
@@ -222,7 +222,7 @@ def plot_results(runs, stats):
     axes[1, 1].legend()
     axes[1, 1].grid(True, alpha=0.3)
 
-    plt.suptitle(f'Stealthy Model Poisoning Attack Analysis (Baruch et al. 2019), '
+    plt.suptitle(f'Naive Reversed/Scaled Poisoning Attack, '
                  f'mean ± std over {baseline["num_seeds"]} seeds', fontsize=14)
     plt.tight_layout()
     os.makedirs(PLOTS_DIR, exist_ok=True)
@@ -279,7 +279,7 @@ def main():
     }
 
     print("=" * 70)
-    print("STEALTHY MODEL POISONING ATTACK EXPERIMENT")
+    print("MODEL POISONING ATTACK EXPERIMENT")
     print(f"Clients: {NUM_CLIENTS}, Malicious: {NUM_MALICIOUS}, Rounds: {args.rounds}, "
           f"Seeds: {args.seeds}")
     print("=" * 70)

@@ -1,3 +1,3 @@
-﻿from .baruch_attack import baruch_attack
+﻿from .reversed_scaled_attack import reversed_scaled_attack
 
-__all__ = ['baruch_attack']
+__all__ = ['reversed_scaled_attack']

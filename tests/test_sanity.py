@@ -15,7 +15,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 sys.path.insert(0, os.path.join(REPO_ROOT, 'experiments'))
 
-from attacks.baruch_attack import baruch_attack
+from attacks.reversed_scaled_attack import reversed_scaled_attack
 from defenses.aggregation import fedavg_aggregate, trimmed_mean_aggregate, krum_aggregate, krum_scores
 from models.cnn_model import get_model
 from utils.data_utils import FLClient
@@ -27,7 +27,7 @@ def weights(*values):
 # ---------- Unit checks on synthetic tensors ----------
 
 def test_attack_reverses_and_scales_update():
-    poisoned = baruch_attack(weights(1.0, 2.0), weights(1.5, 1.0), attack_strength=3.0)
+    poisoned = reversed_scaled_attack(weights(1.0, 2.0), weights(1.5, 1.0), scale=3.0)
     assert torch.allclose(poisoned['w'], torch.tensor([1.0 - 3 * 0.5, 2.0 - 3 * -1.0]))
 
 def test_fedavg_without_counts_is_mean():
@@ -77,7 +77,7 @@ def test_model_output_stays_finite_under_reversed_update():
     model = get_model(8, 3)
     g = {k: v.clone() for k, v in model.state_dict().items()}
     w = {k: v + 0.5 * torch.randn_like(v) for k, v in g.items()}
-    model.load_state_dict(baruch_attack(g, w, attack_strength=5.0))
+    model.load_state_dict(reversed_scaled_attack(g, w, scale=5.0))
     model.eval()
     assert torch.isfinite(model(torch.rand(16, 3, 28, 28))).all()
 
@@ -140,8 +140,8 @@ def test_server_side_tensors_are_on_cpu(monkeypatch):
         for d in dicts:
             devices.update(v.device.type for v in d.values())
 
-    real_attack, real_fedavg = rx.baruch_attack, rx.fedavg_aggregate
-    monkeypatch.setattr(rx, 'baruch_attack',
+    real_attack, real_fedavg = rx.reversed_scaled_attack, rx.fedavg_aggregate
+    monkeypatch.setattr(rx, 'reversed_scaled_attack',
                         lambda g, w, z: (record(g, w), real_attack(g, w, z))[1])
     reported_counts = []
     monkeypatch.setattr(rx, 'fedavg_aggregate',
