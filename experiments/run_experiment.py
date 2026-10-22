@@ -105,6 +105,7 @@ def run_experiment(spec, seed=0, num_rounds=NUM_ROUNDS):
         raise RuntimeError(f"Only {num_valid_clients} clients have enough data (seed {seed})")
 
     actual_malicious = min(NUM_MALICIOUS, max(2, num_valid_clients // 5))
+    # Planned for the next phase: seeded random attackers per seed (docs/planned_changes.md)
     malicious_ids = set(range(actual_malicious)) if attack is not None else set()
     print(f"  Malicious clients: {sorted(malicious_ids)}")
 

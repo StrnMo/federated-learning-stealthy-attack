@@ -9,6 +9,8 @@ def compute_stealthiness(global_weights, poisoned_weights):
     """
     Compute attack stealthiness (L2 norm of attack vector).
     Lower values = more stealthy (harder to detect).
+    Absolute norm only; planned for the next phase: relative to honest-update
+    norms (audit M6, docs/planned_changes.md).
     """
     total = 0.0
     for key in global_weights.keys():
