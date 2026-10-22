@@ -54,13 +54,16 @@ BASELINE = make_spec('fedavg')
 ATTACK_SWEEP = [make_spec('fedavg', z) for z in ATTACK_STRENGTHS]
 DEFENSE_COMPARISON = [make_spec('fedavg', DEFENSE_ATTACK_STRENGTH),
                       make_spec('trimmed_mean', DEFENSE_ATTACK_STRENGTH, trim_ratio=0.2),
-                      make_spec('krum', DEFENSE_ATTACK_STRENGTH)]  # Krum f = true #malicious
+                      make_spec('krum', DEFENSE_ATTACK_STRENGTH),  # Krum f = true #malicious
+                      make_spec('multi_krum', DEFENSE_ATTACK_STRENGTH)]  # m = n - f
 # Each defense also runs without attack, to separate the defense's own cost from the attack's effect
 DEFENSE_CONTROLS = [BASELINE,
                     make_spec('trimmed_mean', trim_ratio=0.2),
-                    make_spec('krum')]
+                    make_spec('krum'),
+                    make_spec('multi_krum')]
 DEFENSE_PAIRS = list(zip(DEFENSE_CONTROLS, DEFENSE_COMPARISON))  # (no attack, under attack)
-DEFENSE_LABELS = {'fedavg': 'FedAvg (No Defense)', 'trimmed_mean': 'Trimmed Mean', 'krum': 'Krum'}
+DEFENSE_LABELS = {'fedavg': 'FedAvg (No Defense)', 'trimmed_mean': 'Trimmed Mean', 'krum': 'Krum',
+                  'multi_krum': 'Multi-Krum'}
 
 # Every distinct spec is run once per seed (FedAvg at z=3 is shared by sweep and comparison)
 CONFIGS = list({s['name']: s for s in [BASELINE] + ATTACK_SWEEP + DEFENSE_COMPARISON

@@ -108,6 +108,25 @@ def krum_aggregate(client_weights, num_malicious=1):
     best_idx = int(np.argmin(krum_scores(client_weights, num_malicious)))
     return copy.deepcopy(client_weights[best_idx])
 
+def multi_krum_select(client_weights, num_malicious, m=None):
+    """
+    Multi-Krum selection (Blanchard et al. 2017): the m clients with the lowest
+    Krum scores, default m = n - f. Returns their positions in ascending order.
+    """
+    num_clients = len(client_weights)
+    m = num_clients - num_malicious if m is None else m
+    if not 1 <= m <= num_clients:
+        raise ValueError(f"Multi-Krum needs 1 <= m <= n (got m={m}, n={num_clients})")
+    scores = krum_scores(client_weights, num_malicious)
+    return sorted(int(i) for i in np.argsort(scores, kind='stable')[:m])
+
+def multi_krum_aggregate(client_weights, num_malicious=1, m=None):
+    """Multi-Krum - unweighted mean of the m selected updates, as in the original paper"""
+    if not client_weights:
+        return None
+    kept = multi_krum_select(client_weights, num_malicious, m)
+    return fedavg_aggregate([client_weights[i] for i in kept])
+
 # ---------- Uniform interface used by the experiment runner ----------
 # Each defense takes (client_weights, num_samples, num_malicious, **params) and returns
 # (aggregate, accepted): accepted lists the client positions the defense kept, or is None
@@ -126,10 +145,16 @@ def _krum(client_weights, num_samples, num_malicious, f=None):
     best_idx = int(np.argmin(krum_scores(client_weights, f)))
     return copy.deepcopy(client_weights[best_idx]), [best_idx]
 
+def _multi_krum(client_weights, num_samples, num_malicious, f=None, m=None):
+    f = num_malicious if f is None else f
+    kept = multi_krum_select(client_weights, f, m)
+    return fedavg_aggregate([client_weights[i] for i in kept]), kept
+
 DEFENSES = {
     'fedavg': _fedavg,
     'trimmed_mean': _trimmed_mean,
     'krum': _krum,
+    'multi_krum': _multi_krum,
 }
 
 def aggregate(name, client_weights, num_samples, num_malicious, **params):

@@ -17,7 +17,8 @@ sys.path.insert(0, os.path.join(REPO_ROOT, 'experiments'))
 
 from attacks import apply_attack
 from attacks.reversed_scaled_attack import reversed_scaled_attack
-from defenses.aggregation import fedavg_aggregate, trimmed_mean_aggregate, krum_aggregate, krum_scores, aggregate
+from defenses.aggregation import (fedavg_aggregate, trimmed_mean_aggregate, krum_aggregate, krum_scores,
+                                  multi_krum_select, multi_krum_aggregate, aggregate)
 from models.cnn_model import get_model
 from utils.data_utils import FLClient
 from utils.metrics import classification_metrics, confusion_matrix, detection_rates
@@ -114,6 +115,26 @@ def test_local_update_ignores_previous_rounds():
     a, b = updates
     assert all(torch.equal(a[k], b[k]) for k in a)
 
+def test_multi_krum_averages_lowest_scoring_clients():
+    clients = [weights(float(x), float(y)) for x, y in KRUM_POINTS]
+    # Scores [67, 91, 75, 117, 107, 143]: the 3 lowest are clients 0, 2, 1
+    assert multi_krum_select(clients, num_malicious=1, m=3) == [0, 1, 2]
+    agg = multi_krum_aggregate(clients, num_malicious=1, m=3)
+    assert torch.allclose(agg['w'], torch.tensor([-5.0, -3.0]))  # mean of (-5,0), (-5,-5), (-5,-4)
+
+def test_multi_krum_drops_outliers_with_default_m():
+    clients = [weights(float(v)) for v in [0.0, 0.1, -0.1, 0.2, -0.2, 0.05, -0.05, 0.15]]
+    clients += [weights(100.0), weights(100.0)]
+    agg, kept = aggregate('multi_krum', clients, [10] * 10, 2)  # m = n - f = 8
+    assert kept == list(range(8))
+    assert abs(agg['w'].item()) < 1.0
+    assert detection_rates(kept, range(10), {8, 9}) == {'tpr': 1.0, 'fpr': 0.0}
+
+def test_multi_krum_rejects_invalid_m():
+    clients = [weights(float(x), float(y)) for x, y in KRUM_POINTS]
+    with pytest.raises(ValueError):
+        multi_krum_select(clients, num_malicious=1, m=0)
+
 def test_defense_registry_reports_kept_clients():
     clients = [weights(float(x), float(y)) for x, y in KRUM_POINTS]
     _, kept = aggregate('krum', clients, [10] * 6, 1)
@@ -192,7 +213,8 @@ def test_every_defense_has_a_no_attack_control():
         assert control['defense'] == attacked['defense']
     names = [s['name'] for s in rx.CONFIGS]
     assert len(names) == len(set(names))
-    assert {'trimmed_mean_no_attack', 'krum_no_attack'} <= set(names)
+    assert {'trimmed_mean_no_attack', 'krum_no_attack', 'multi_krum_no_attack',
+            'multi_krum_reversed_scaled_z3.0'} <= set(names)
     assert EXISTING_CONFIG_NAMES <= set(names)
 
 # ---------- End-to-end checks on BloodMNIST (short runs) ----------
