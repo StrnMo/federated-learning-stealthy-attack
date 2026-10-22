@@ -30,9 +30,17 @@ def test_attack_reverses_and_scales_update():
     poisoned = baruch_attack(weights(1.0, 2.0), weights(1.5, 1.0), attack_strength=3.0)
     assert torch.allclose(poisoned['w'], torch.tensor([1.0 - 3 * 0.5, 2.0 - 3 * -1.0]))
 
-def test_fedavg_is_mean():
+def test_fedavg_without_counts_is_mean():
     agg = fedavg_aggregate([weights(0.0), weights(2.0), weights(4.0)])
     assert torch.allclose(agg['w'], torch.tensor([2.0]))
+
+def test_fedavg_weights_by_sample_count():
+    agg = fedavg_aggregate([weights(0.0, 1.0), weights(4.0, 5.0)], num_samples=[300, 100])
+    assert torch.allclose(agg['w'], torch.tensor([1.0, 2.0]))  # 0.75*w1 + 0.25*w2
+
+def test_fedavg_rejects_mismatched_counts():
+    with pytest.raises(ValueError):
+        fedavg_aggregate([weights(0.0), weights(1.0)], num_samples=[10])
 
 def test_trimmed_mean_drops_extremes():
     clients = [weights(float(v)) for v in [-100, 1, 2, 3, 4, 5, 6, 7, 8, 100]]
@@ -122,10 +130,14 @@ def test_server_side_tensors_are_on_cpu(monkeypatch):
     real_attack, real_fedavg = rx.baruch_attack, rx.fedavg_aggregate
     monkeypatch.setattr(rx, 'baruch_attack',
                         lambda g, w, z: (record(g, w), real_attack(g, w, z))[1])
+    reported_counts = []
     monkeypatch.setattr(rx, 'fedavg_aggregate',
-                        lambda ws: (record(*ws), real_fedavg(ws))[1])
-    rx.run_experiment(3.0, 'fedavg', seed=0, num_rounds=1)
+                        lambda ws, ns: (record(*ws), reported_counts.append(ns), real_fedavg(ws, ns))[2])
+    result = rx.run_experiment(3.0, 'fedavg', seed=0, num_rounds=1)
     assert devices == {'cpu'}
+    # FedAvg receives every active client's true sample count
+    active_sizes = [n for n in result['client_sizes'] if n >= rx.MIN_SAMPLES_PER_CLIENT]
+    assert reported_counts == [active_sizes]
 
 def test_pipeline_writes_results(tmp_path, monkeypatch):
     monkeypatch.setattr(rx, 'RESULTS_DIR', str(tmp_path / 'results'))

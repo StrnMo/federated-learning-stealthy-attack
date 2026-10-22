@@ -90,6 +90,7 @@ def run_experiment(attack_strength, defense='fedavg', seed=0, num_rounds=NUM_ROU
     # Federated training rounds
     for round_idx in range(num_rounds):
         client_weights = []
+        client_num_samples = []  # malicious clients report their true sample counts
 
         for i, client in enumerate(clients):
             if client is None or not client.has_data:
@@ -101,6 +102,7 @@ def run_experiment(attack_strength, defense='fedavg', seed=0, num_rounds=NUM_ROU
 
             if honest_weights is None:
                 continue
+            client_num_samples.append(client.num_samples)
 
             # Apply attack if malicious
             is_malicious = (i < actual_malicious and attack_strength > 1.0)
@@ -121,7 +123,7 @@ def run_experiment(attack_strength, defense='fedavg', seed=0, num_rounds=NUM_ROU
         elif defense == 'krum':
             global_weights = krum_aggregate(client_weights, actual_malicious)
         else:  # fedavg
-            global_weights = fedavg_aggregate(client_weights)
+            global_weights = fedavg_aggregate(client_weights, client_num_samples)
 
         if global_weights is not None:
             global_model.load_state_dict(global_weights)
@@ -265,6 +267,7 @@ def main():
         'num_clients': NUM_CLIENTS,
         'num_rounds': args.rounds,
         'num_malicious': NUM_MALICIOUS,
+        'fedavg_weighting': 'client sample count (malicious clients report true counts)',
         'local_epochs': LOCAL_EPOCHS,
         'batch_size': BATCH_SIZE,
         'optimizer': {'name': 'sgd', 'lr': LEARNING_RATE, 'momentum': MOMENTUM,

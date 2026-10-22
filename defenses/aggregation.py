@@ -7,20 +7,26 @@ import copy
 import torch
 import numpy as np
 
-def fedavg_aggregate(client_weights):
-    """Standard Federated Averaging"""
+def fedavg_aggregate(client_weights, num_samples=None):
+    """
+    Federated Averaging (McMahan et al. 2017): mean weighted by n_k / sum(n).
+    Without num_samples every client gets equal weight.
+    """
     if not client_weights:
         return None
-    
+    if num_samples is None:
+        num_samples = [1] * len(client_weights)
+    if len(num_samples) != len(client_weights):
+        raise ValueError("num_samples must have one entry per client")
+    total = float(sum(num_samples))
+    coeffs = [n / total for n in num_samples]
+
     avg = copy.deepcopy(client_weights[0])
     for key in avg.keys():
         if avg[key].dtype == torch.long:
             continue
         # Convert to float for accumulation
-        avg[key] = avg[key].float()
-        for w in client_weights[1:]:
-            avg[key] += w[key].float()
-        avg[key] = avg[key] / len(client_weights)
+        avg[key] = sum(c * w[key].float() for c, w in zip(coeffs, client_weights))
     return avg
 
 def trimmed_mean_aggregate(client_weights, trim_ratio=0.2):

@@ -42,6 +42,7 @@ class FLClient:
                  lr=0.01, momentum=0.9):
         self.client_id = client_id
         self.has_data = len(dataset) > 0
+        self.num_samples = len(dataset)
         self.device = device
         self.local_epochs = local_epochs
         self.lr = lr
