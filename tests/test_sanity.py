@@ -219,7 +219,8 @@ def test_every_defense_has_a_no_attack_control():
             'multi_krum_reversed_scaled_z3.0'} <= set(names)
     assert EXISTING_CONFIG_NAMES <= set(names)
 
-def fake_run(seed, accuracy=0.8, status='valid', nonfinite_from_round=None, rounds=3):
+def fake_run(seed, accuracy=0.8, status='valid', nonfinite_from_round=None, rounds=3,
+             client_sizes=None, malicious_ids=(0, 1, 2, 3)):
     """Minimal saved-run dict, as loaded from a result JSON"""
     cm = np.zeros((8, 8), dtype=int)
     if status == 'valid':
@@ -233,6 +234,7 @@ def fake_run(seed, accuracy=0.8, status='valid', nonfinite_from_round=None, roun
                 'val_nonfinite_samples': 1712 if nonfinite_from_round and r >= nonfinite_from_round else 0,
                 'kept_clients': None, 'detection': None} for r in range(1, rounds + 1)]
     return {'seed': seed, 'test': test, 'history': history,
+            'client_sizes': client_sizes or [100] * 20, 'malicious_ids': list(malicious_ids),
             'stealthiness': float('nan') if status == 'diverged' else 5.0}
 
 def test_run_status_flags_diverged_and_degenerate_runs():
@@ -251,8 +253,10 @@ def test_summary_excludes_diverged_and_degenerate_runs():
     assert (s['valid_seeds'], s['diverged_seeds'], s['degenerate_seeds']) == ([0, 1], [2, 4], [3])
     assert s['test_accuracy']['mean'] == pytest.approx(0.7)  # valid seeds only
     assert s['stealthiness']['mean'] == 5.0                  # no NaN from the diverged runs
-    assert s['per_seed_status'][2] == {'seed': 2, 'status': 'diverged', 'first_nonfinite_round': 2}
-    assert s['per_seed_status'][4]['first_nonfinite_round'] is None  # non-finite on test only
+    row = s['per_seed'][2]
+    assert (row['seed'], row['status'], row['first_nonfinite_round']) == (2, 'diverged', 2)
+    assert s['per_seed'][4]['first_nonfinite_round'] is None  # non-finite on test only
+    assert [r['test_accuracy'] for r in s['per_seed']] == [0.8, 0.6, 0.0713, 0.19, 0.0713]
     assert rx.counts_label(s) == '[2/5 valid: 2 diverged, 1 degenerate]'
     assert rx.format_metric(s['test_accuracy'], s).endswith('[2/5 valid: 2 diverged, 1 degenerate]')
 
@@ -275,6 +279,14 @@ def test_plot_and_summary_handle_fully_excluded_configs(tmp_path, capsys):
     assert width < 3000 and height < 2500  # labels stay inside the figure
     out = capsys.readouterr().out
     assert '— [0/3 valid: 3 diverged]' in out and 'seed 2: diverged' in out
+    assert 'Per-seed results (FedAvg' in out and '20.0%' in out
+
+def test_attacker_data_share_is_their_fedavg_weight():
+    # Clients 0-3 attack; client 19 has too few samples and does not participate
+    sizes = [300, 100, 50, 50] + [100] * 15 + [rx.PARTITION['min_samples'] - 1]
+    run = fake_run(0, client_sizes=sizes)
+    assert rx.attacker_data_share(run) == pytest.approx(500 / 2000)
+    assert rx.attacker_data_share(fake_run(0, malicious_ids=())) is None  # no-attack run
 
 # ---------- End-to-end checks on BloodMNIST (short runs) ----------
 

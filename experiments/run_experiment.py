@@ -205,6 +205,28 @@ def first_nonfinite_round(run):
     """First round with non-finite validation outputs, or None if none were seen on validation"""
     return next((h['round'] for h in run['history'] if h['val_nonfinite_samples'] > 0), None)
 
+def attacker_data_share(run):
+    """
+    Attackers' share of the training data held by participating clients, which is also
+    their total weight in sample-weighted FedAvg; None when the run has no attackers.
+    """
+    if not run['malicious_ids']:
+        return None
+    sizes = run['client_sizes']
+    participating = [n for n in sizes if n >= PARTITION['min_samples']]
+    return sum(sizes[i] for i in run['malicious_ids']) / sum(participating)
+
+def per_seed_row(run, status):
+    return {
+        'seed': run['seed'],
+        'status': status,
+        'first_nonfinite_round': first_nonfinite_round(run),
+        'attacker_data_share': attacker_data_share(run),
+        'test_accuracy': run['test']['accuracy'],
+        'test_balanced_accuracy': run['test']['balanced_accuracy'],
+        'stealthiness': run['stealthiness'],
+    }
+
 def summarise(runs):
     """
     Mean and sample std over seeds of the final test metrics, stealthiness and detection.
@@ -218,9 +240,7 @@ def summarise(runs):
         seeds = [r['seed'] for r, st in zip(runs, statuses) if st == status]
         summary[f'num_{status}'] = len(seeds)
         summary[f'{status}_seeds'] = seeds
-    summary['per_seed_status'] = [
-        {'seed': r['seed'], 'status': status, 'first_nonfinite_round': first_nonfinite_round(r)}
-        for r, status in zip(runs, statuses)]
+    summary['per_seed'] = [per_seed_row(r, status) for r, status in zip(runs, statuses)]
 
     def stat(values):
         return mean_std(values) if values else None
@@ -378,7 +398,18 @@ def print_summary(stats, results_dir, plots_dir):
             if s['detection_fpr'] is not None:
                 line += f", FPR {format_metric(s['detection_fpr'], s)}"
             print(line)
-    excluded = [(name, row) for name, s in stats.items() for row in s['per_seed_status']
+    print("\nPer-seed results (FedAvg; attacker share = attackers' FedAvg weight):")
+    print(f"  {'config':<30} {'seed':>4}  {'status':<10} {'1st non-finite':>14}  "
+          f"{'attacker share':>14}  {'acc':>6}  {'balanced':>8}")
+    for spec in [BASELINE] + ATTACK_SWEEP:
+        for row in stats[spec['name']]['per_seed']:
+            first = row['first_nonfinite_round']
+            share = row['attacker_data_share']
+            print(f"  {spec['name']:<30} {row['seed']:>4}  {row['status']:<10} "
+                  f"{'round ' + str(first) if first else '—':>14}  "
+                  f"{'—' if share is None else f'{share:.1%}':>14}  "
+                  f"{row['test_accuracy']:>6.4f}  {row['test_balanced_accuracy']:>8.4f}")
+    excluded = [(name, row) for name, s in stats.items() for row in s['per_seed']
                 if row['status'] != 'valid']
     if excluded:
         print("\nExcluded runs:")
