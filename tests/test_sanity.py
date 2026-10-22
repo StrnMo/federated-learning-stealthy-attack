@@ -7,6 +7,8 @@ Sanity checks for the FL pipeline. Run from the repo root with:
 import os
 import sys
 import json
+import matplotlib.pyplot as plt
+import numpy as np
 import pytest
 import torch
 from torch.utils.data import TensorDataset
@@ -216,6 +218,63 @@ def test_every_defense_has_a_no_attack_control():
     assert {'trimmed_mean_no_attack', 'krum_no_attack', 'multi_krum_no_attack',
             'multi_krum_reversed_scaled_z3.0'} <= set(names)
     assert EXISTING_CONFIG_NAMES <= set(names)
+
+def fake_run(seed, accuracy=0.8, status='valid', nonfinite_from_round=None, rounds=3):
+    """Minimal saved-run dict, as loaded from a result JSON"""
+    cm = np.zeros((8, 8), dtype=int)
+    if status == 'valid':
+        np.fill_diagonal(cm, 10)
+        cm[0, 1] = 5
+    else:
+        cm[:, 0] = 10  # every prediction in class 0 (what argmax of NaN rows also gives)
+    test = {**classification_metrics(cm), 'accuracy': accuracy, 'confusion_matrix': cm.tolist(),
+            'nonfinite_samples': 3421 if status == 'diverged' else 0}
+    history = [{'round': r, 'val_accuracy': accuracy, 'val_balanced_accuracy': accuracy,
+                'val_nonfinite_samples': 1712 if nonfinite_from_round and r >= nonfinite_from_round else 0,
+                'kept_clients': None, 'detection': None} for r in range(1, rounds + 1)]
+    return {'seed': seed, 'test': test, 'history': history,
+            'stealthiness': float('nan') if status == 'diverged' else 5.0}
+
+def test_run_status_flags_diverged_and_degenerate_runs():
+    assert rx.run_status(fake_run(0)) == 'valid'
+    assert rx.run_status(fake_run(0, status='diverged')) == 'diverged'
+    assert rx.run_status(fake_run(0, status='degenerate')) == 'degenerate'
+    assert rx.first_nonfinite_round(fake_run(0, status='diverged', nonfinite_from_round=2)) == 2
+    assert rx.first_nonfinite_round(fake_run(0)) is None
+
+def test_summary_excludes_diverged_and_degenerate_runs():
+    runs = [fake_run(0, 0.8), fake_run(1, 0.6),
+            fake_run(2, 0.0713, 'diverged', nonfinite_from_round=2),
+            fake_run(3, 0.19, 'degenerate'), fake_run(4, 0.0713, 'diverged')]
+    s = rx.summarise(runs)
+    assert (s['num_valid'], s['num_diverged'], s['num_degenerate']) == (2, 2, 1)
+    assert (s['valid_seeds'], s['diverged_seeds'], s['degenerate_seeds']) == ([0, 1], [2, 4], [3])
+    assert s['test_accuracy']['mean'] == pytest.approx(0.7)  # valid seeds only
+    assert s['stealthiness']['mean'] == 5.0                  # no NaN from the diverged runs
+    assert s['per_seed_status'][2] == {'seed': 2, 'status': 'diverged', 'first_nonfinite_round': 2}
+    assert s['per_seed_status'][4]['first_nonfinite_round'] is None  # non-finite on test only
+    assert rx.counts_label(s) == '[2/5 valid: 2 diverged, 1 degenerate]'
+    assert rx.format_metric(s['test_accuracy'], s).endswith('[2/5 valid: 2 diverged, 1 degenerate]')
+
+def test_summary_reports_nothing_when_no_run_is_valid():
+    s = rx.summarise([fake_run(0, status='diverged'), fake_run(1, status='degenerate')])
+    assert s['test_accuracy'] is None and s['stealthiness'] is None
+    assert s['test_per_class_recall_mean'] is None
+    assert rx.format_metric(s['test_accuracy'], s) == '— [0/2 valid: 1 diverged, 1 degenerate]'
+    assert rx.counts_label(rx.summarise([fake_run(0)])) == '[1/1 valid]'
+
+def test_plot_and_summary_handle_fully_excluded_configs(tmp_path, capsys):
+    # FedAvg at z >= 2 diverged on every seed in the Colab results
+    bad = {s['name'] for s in rx.ATTACK_SWEEP[1:]}
+    runs = {spec['name']: [fake_run(seed, status='diverged' if spec['name'] in bad else 'valid')
+                           for seed in range(3)] for spec in rx.CONFIGS}
+    stats = {name: rx.summarise(r) for name, r in runs.items()}
+    rx.plot_results(runs, stats, str(tmp_path))
+    rx.print_summary(stats, str(tmp_path), str(tmp_path))
+    height, width = plt.imread(tmp_path / 'experiment_results.png').shape[:2]
+    assert width < 3000 and height < 2500  # labels stay inside the figure
+    out = capsys.readouterr().out
+    assert '— [0/3 valid: 3 diverged]' in out and 'seed 2: diverged' in out
 
 # ---------- End-to-end checks on BloodMNIST (short runs) ----------
 
