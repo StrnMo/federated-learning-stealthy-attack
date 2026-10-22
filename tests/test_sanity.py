@@ -9,6 +9,7 @@ import sys
 import json
 import pytest
 import torch
+from torch.utils.data import TensorDataset
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
@@ -17,6 +18,7 @@ sys.path.insert(0, os.path.join(REPO_ROOT, 'experiments'))
 from attacks.baruch_attack import baruch_attack
 from defenses.aggregation import fedavg_aggregate, trimmed_mean_aggregate, krum_aggregate
 from models.cnn_model import get_model
+from utils.data_utils import FLClient
 import run_experiment as rx
 
 def weights(*values):
@@ -57,6 +59,37 @@ def test_model_output_stays_finite_under_reversed_update():
     model.load_state_dict(baruch_attack(g, w, attack_strength=5.0))
     model.eval()
     assert torch.isfinite(model(torch.rand(16, 3, 28, 28))).all()
+
+TINY_DATA = TensorDataset(torch.rand(64, 3, 28, 28), torch.randint(0, 8, (64, 1)))
+
+def tiny_client(**kwargs):
+    return FLClient(0, TINY_DATA, get_model(8, 3), torch.device('cpu'), batch_size=32,
+                    local_epochs=1, seed=0, **kwargs)
+
+def test_client_uses_fresh_sgd_each_round():
+    client = tiny_client(lr=0.01, momentum=0.9)
+    client.train()
+    first = client.optimizer
+    client.train()
+    assert isinstance(client.optimizer, torch.optim.SGD)
+    assert client.optimizer is not first
+    group = client.optimizer.param_groups[0]
+    assert (group['lr'], group['momentum']) == (0.01, 0.9)
+
+def test_local_update_ignores_previous_rounds():
+    # Same start weights and same batches must give the same update, whatever came before
+    start = {k: v.clone() for k, v in get_model(8, 3).state_dict().items()}
+    fresh, used = tiny_client(), tiny_client()
+    used.set_weights(start)
+    used.train()  # one extra round of history
+    updates = []
+    for c in (fresh, used):
+        c.dataloader.generator.manual_seed(123)  # same batch order
+        torch.manual_seed(123)                   # same dropout masks
+        c.set_weights(start)
+        updates.append(c.train())
+    a, b = updates
+    assert all(torch.equal(a[k], b[k]) for k in a)
 
 # ---------- End-to-end checks on BloodMNIST (short runs) ----------
 

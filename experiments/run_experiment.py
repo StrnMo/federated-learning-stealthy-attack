@@ -26,6 +26,8 @@ NUM_ROUNDS = 30
 NUM_MALICIOUS = 4
 LOCAL_EPOCHS = 2
 BATCH_SIZE = 32
+LEARNING_RATE = 0.01  # client SGD; not yet tuned on the validation split
+MOMENTUM = 0.9
 MIN_SAMPLES_PER_CLIENT = 30
 DIRICHLET_ALPHA = 0.5
 ATTACK_STRENGTHS = [1.5, 2.0, 3.0, 5.0]
@@ -63,7 +65,8 @@ def run_experiment(attack_strength, defense='fedavg', seed=0, num_rounds=NUM_ROU
         if len(indices) >= MIN_SAMPLES_PER_CLIENT:
             subset = Subset(train_data, indices)
             clients.append(FLClient(i, subset, copy.deepcopy(base_model), DEVICE,
-                                    BATCH_SIZE, LOCAL_EPOCHS, seed=seed * 1000 + i))
+                                    BATCH_SIZE, LOCAL_EPOCHS, seed=seed * 1000 + i,
+                                    lr=LEARNING_RATE, momentum=MOMENTUM))
         else:
             clients.append(None)
 
@@ -264,6 +267,8 @@ def main():
         'num_malicious': NUM_MALICIOUS,
         'local_epochs': LOCAL_EPOCHS,
         'batch_size': BATCH_SIZE,
+        'optimizer': {'name': 'sgd', 'lr': LEARNING_RATE, 'momentum': MOMENTUM,
+                      'state': 'reset every round'},
         'min_samples_per_client': MIN_SAMPLES_PER_CLIENT,
         'dirichlet_alpha': DIRICHLET_ALPHA,
         'seeds': args.seeds,

@@ -38,11 +38,14 @@ class TransformedBloodMNIST(BloodMNIST):
 
 class FLClient:
     """Federated Learning client with local training"""
-    def __init__(self, client_id, dataset, model, device, batch_size=32, local_epochs=2, seed=None):
+    def __init__(self, client_id, dataset, model, device, batch_size=32, local_epochs=2, seed=None,
+                 lr=0.01, momentum=0.9):
         self.client_id = client_id
         self.has_data = len(dataset) > 0
         self.device = device
         self.local_epochs = local_epochs
+        self.lr = lr
+        self.momentum = momentum
 
         if not self.has_data:
             return
@@ -52,7 +55,7 @@ class FLClient:
         generator = torch.Generator().manual_seed(seed) if seed is not None else None
         self.dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True,
                                      generator=generator)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=0.001)
+        self.optimizer = None
         self.criterion = torch.nn.CrossEntropyLoss()
         
     def set_weights(self, weights):
@@ -69,7 +72,9 @@ class FLClient:
         """Perform local training and return updated weights"""
         if not self.has_data:
             return None
-            
+
+        # Fresh optimizer each round: no momentum carried over from a previous global model
+        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr, momentum=self.momentum)
         self.model.train()
         for epoch in range(self.local_epochs):
             for images, labels in self.dataloader:
