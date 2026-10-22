@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.join(REPO_ROOT, 'experiments'))
 
 from attacks.baruch_attack import baruch_attack
 from defenses.aggregation import fedavg_aggregate, trimmed_mean_aggregate, krum_aggregate
+from models.cnn_model import get_model
 import run_experiment as rx
 
 def weights(*values):
@@ -41,6 +42,21 @@ def test_krum_rejects_outliers():
     clients += [weights(100.0), weights(100.0)]
     agg = krum_aggregate(clients, num_malicious=2)
     assert abs(agg['w'].item()) < 1.0
+
+def test_model_state_is_only_trainable_parameters():
+    # No normalisation buffers that could be averaged across clients or flipped by an attack
+    model = get_model(8, 3)
+    assert list(model.buffers()) == []
+    assert set(model.state_dict()) == {name for name, _ in model.named_parameters()}
+
+def test_model_output_stays_finite_under_reversed_update():
+    # With BatchNorm, reversing running_var made it negative and every logit NaN
+    model = get_model(8, 3)
+    g = {k: v.clone() for k, v in model.state_dict().items()}
+    w = {k: v + 0.5 * torch.randn_like(v) for k, v in g.items()}
+    model.load_state_dict(baruch_attack(g, w, attack_strength=5.0))
+    model.eval()
+    assert torch.isfinite(model(torch.rand(16, 3, 28, 28))).all()
 
 # ---------- End-to-end checks on BloodMNIST (short runs) ----------
 
