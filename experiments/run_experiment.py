@@ -17,7 +17,7 @@ from models.cnn_model import get_model
 from attacks import apply_attack
 from defenses.aggregation import aggregate
 from utils.data_utils import load_data, partition_data, FLClient, DEVICE
-from utils.metrics import compute_stealthiness, evaluate_model
+from utils.metrics import compute_stealthiness, evaluate, detection_rates
 from utils.reproducibility import set_seed, get_git_info, save_results
 
 # Experiment Configuration
@@ -68,9 +68,10 @@ def run_experiment(spec, seed=0, num_rounds=NUM_ROUNDS):
     """
     set_seed(seed)
     attack, defense = spec['attack'], spec['defense']
+    target_class = attack['target_class'] if attack is not None else None
 
     # Load data
-    train_data, test_loader, num_classes = load_data()
+    train_data, val_loader, test_loader, num_classes = load_data()
     client_indices = partition_data(train_data, NUM_CLIENTS, PARTITION,
                                     rng=np.random.default_rng(seed))
 
@@ -101,9 +102,8 @@ def run_experiment(spec, seed=0, num_rounds=NUM_ROUNDS):
     global_model = copy.deepcopy(base_model)
     global_weights = {k: v.cpu().clone() for k, v in global_model.state_dict().items()}
 
-    accuracies = []
+    history = []  # per-round validation metrics and defense decisions
     stealthiness_scores = []
-    accepted_per_round = []  # client ids each defense kept (None if it keeps no whole clients)
 
     # Federated training rounds
     for round_idx in range(num_rounds):
@@ -135,14 +135,28 @@ def run_experiment(spec, seed=0, num_rounds=NUM_ROUNDS):
         # Aggregate updates; defenses that need f assume the configured number of attackers
         global_weights, accepted = aggregate(defense['name'], client_weights, client_num_samples,
                                              actual_malicious, **defense['params'])
-        accepted_per_round.append(None if accepted is None else [client_ids[j] for j in accepted])
-
+        kept_ids = None if accepted is None else [client_ids[j] for j in accepted]
         global_model.load_state_dict(global_weights)
-        acc = evaluate_model(global_model, test_loader, DEVICE)
-        accuracies.append(acc)
+
+        # Monitor on the validation split only; the test split is evaluated once, after training
+        val = evaluate(global_model, val_loader, DEVICE, num_classes, target_class)
+        history.append({
+            'round': round_idx + 1,
+            'val_accuracy': val['accuracy'],
+            'val_balanced_accuracy': val['balanced_accuracy'],
+            'val_nonfinite_samples': val['nonfinite_samples'],
+            'kept_clients': kept_ids,
+            'detection': detection_rates(kept_ids, client_ids, malicious_ids),
+        })
 
         if (round_idx + 1) % 10 == 0:
-            print(f"    Round {round_idx + 1}: Acc = {acc:.4f}")
+            print(f"    Round {round_idx + 1}: Val acc = {val['accuracy']:.4f}, "
+                  f"balanced = {val['balanced_accuracy']:.4f}")
+
+    test = evaluate(global_model, test_loader, DEVICE, num_classes, target_class)
+    print(f"  Test: acc = {test['accuracy']:.4f}, balanced = {test['balanced_accuracy']:.4f}")
+    if test['nonfinite_samples']:
+        print(f"  WARNING: {test['nonfinite_samples']} test samples had non-finite logits")
 
     return {
         'spec': spec,
@@ -150,24 +164,41 @@ def run_experiment(spec, seed=0, num_rounds=NUM_ROUNDS):
         'num_malicious': len(malicious_ids),
         'malicious_ids': sorted(malicious_ids),
         'client_sizes': [len(idx) for idx in client_indices],
-        'final_accuracy': accuracies[-1] if accuracies else 0,
         'stealthiness': float(np.mean(stealthiness_scores)) if stealthiness_scores else 0.0,
-        'accuracies': accuracies,
-        'accepted_clients': accepted_per_round
+        'final_val': val,
+        'test': test,
+        'history': history,
     }
 
+def mean_detection(run, key):
+    """Mean of a detection rate over rounds, or None if the defense does not select clients"""
+    values = [h['detection'][key] for h in run['history']
+              if h['detection'] is not None and h['detection'][key] is not None]
+    return float(np.mean(values)) if values else None
+
+def mean_std(values):
+    return {'mean': float(np.mean(values)),
+            'std': float(np.std(values, ddof=1)) if len(values) > 1 else 0.0}
+
 def summarise(runs):
-    """Mean and sample std over seeds of the final accuracy and stealthiness"""
+    """Mean and sample std over seeds of the final test metrics, stealthiness and detection"""
     summary = {'num_seeds': len(runs), 'seeds': [r['seed'] for r in runs]}
-    for metric in ['final_accuracy', 'stealthiness']:
-        values = [r[metric] for r in runs]
-        summary[f'{metric}_mean'] = float(np.mean(values))
-        summary[f'{metric}_std'] = float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
+    summary['test_accuracy'] = mean_std([r['test']['accuracy'] for r in runs])
+    summary['test_balanced_accuracy'] = mean_std([r['test']['balanced_accuracy'] for r in runs])
+    summary['test_per_class_recall_mean'] = np.nanmean(
+        [[np.nan if v is None else v for v in r['test']['per_class_recall']] for r in runs],
+        axis=0).tolist()
+    summary['stealthiness'] = mean_std([r['stealthiness'] for r in runs])
+    for key in ['tpr', 'fpr']:
+        values = [mean_detection(r, key) for r in runs]
+        summary[f'detection_{key}'] = (mean_std(values) if all(v is not None for v in values)
+                                       else None)
+    summary['test_nonfinite_samples'] = sum(r['test']['nonfinite_samples'] for r in runs)
     return summary
 
 def plot_curve(ax, runs, label, style):
-    """Mean accuracy per round with a ±1 std band over seeds"""
-    curves = np.array([r['accuracies'] for r in runs])
+    """Mean validation accuracy per round with a ±1 std band over seeds"""
+    curves = np.array([[h['val_accuracy'] for h in r['history']] for r in runs])
     mean, std = curves.mean(axis=0), curves.std(axis=0)
     rounds = np.arange(1, curves.shape[1] + 1)
     line, = ax.plot(rounds, mean, style, label=label, linewidth=2)
@@ -178,16 +209,17 @@ def plot_results(runs, stats):
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
     baseline = stats[BASELINE['name']]
-    baseline_label = (f'Baseline: {baseline["final_accuracy_mean"]:.3f} '
-                      f'± {baseline["final_accuracy_std"]:.3f}')
+    baseline_acc = baseline['test_accuracy']
+    baseline_label = f'Baseline: {baseline_acc["mean"]:.3f} ± {baseline_acc["std"]:.3f}'
     attack_stats = [stats[s['name']] for s in ATTACK_SWEEP]
 
     # Plot 1: Accuracy vs Attack Strength
-    axes[0, 0].errorbar(ATTACK_STRENGTHS, [s['final_accuracy_mean'] for s in attack_stats],
-                        yerr=[s['final_accuracy_std'] for s in attack_stats],
-                        fmt='ro-', linewidth=2, markersize=8, capsize=4, label='FedAvg')
-    axes[0, 0].axhline(y=baseline['final_accuracy_mean'], color='g', linestyle='--',
-                       label=baseline_label)
+    for metric, fmt, label in [('test_accuracy', 'ro-', 'FedAvg accuracy'),
+                               ('test_balanced_accuracy', 'm^--', 'FedAvg balanced accuracy')]:
+        axes[0, 0].errorbar(ATTACK_STRENGTHS, [s[metric]['mean'] for s in attack_stats],
+                            yerr=[s[metric]['std'] for s in attack_stats],
+                            fmt=fmt, linewidth=2, markersize=8, capsize=4, label=label)
+    axes[0, 0].axhline(y=baseline_acc['mean'], color='g', linestyle='--', label=baseline_label)
     axes[0, 0].set_xlabel('Attack Strength (z)')
     axes[0, 0].set_ylabel('Final Test Accuracy')
     axes[0, 0].set_title('Model Accuracy vs Attack Strength')
@@ -195,8 +227,8 @@ def plot_results(runs, stats):
     axes[0, 0].grid(True, alpha=0.3)
 
     # Plot 2: Stealthiness (Lower = More Stealthy)
-    axes[0, 1].errorbar(ATTACK_STRENGTHS, [s['stealthiness_mean'] for s in attack_stats],
-                        yerr=[s['stealthiness_std'] for s in attack_stats],
+    axes[0, 1].errorbar(ATTACK_STRENGTHS, [s['stealthiness']['mean'] for s in attack_stats],
+                        yerr=[s['stealthiness']['std'] for s in attack_stats],
                         fmt='bs-', linewidth=2, markersize=8, capsize=4)
     axes[0, 1].set_xlabel('Attack Strength (z)')
     axes[0, 1].set_ylabel('Attack Magnitude (L2 norm)')
@@ -206,11 +238,11 @@ def plot_results(runs, stats):
     # Plot 3: Defense Comparison
     defense_names = [DEFENSE_LABELS[s['defense']['name']] for s in DEFENSE_COMPARISON]
     defense_stats = [stats[s['name']] for s in DEFENSE_COMPARISON]
-    defense_means = [s['final_accuracy_mean'] for s in defense_stats]
-    defense_stds = [s['final_accuracy_std'] for s in defense_stats]
+    defense_means = [s['test_accuracy']['mean'] for s in defense_stats]
+    defense_stds = [s['test_accuracy']['std'] for s in defense_stats]
     bars = axes[1, 0].bar(defense_names, defense_means, yerr=defense_stds, capsize=6,
                           color=['red', 'blue', 'green'])
-    axes[1, 0].axhline(y=baseline['final_accuracy_mean'], color='black', linestyle='--',
+    axes[1, 0].axhline(y=baseline_acc['mean'], color='black', linestyle='--',
                        label=baseline_label)
     axes[1, 0].set_ylabel('Test Accuracy')
     axes[1, 0].set_title(f'Defense Effectiveness (Attack Strength = {DEFENSE_ATTACK_STRENGTH})')
@@ -226,8 +258,8 @@ def plot_results(runs, stats):
         plot_curve(axes[1, 1], runs[s['name']], f'z={strength}', '-')
     plot_curve(axes[1, 1], runs[BASELINE['name']], 'Baseline', 'g--')
     axes[1, 1].set_xlabel('Round')
-    axes[1, 1].set_ylabel('Accuracy')
-    axes[1, 1].set_title('Training Progress Over Rounds')
+    axes[1, 1].set_ylabel('Validation Accuracy')
+    axes[1, 1].set_title('Training Progress Over Rounds (validation split)')
     axes[1, 1].legend()
     axes[1, 1].grid(True, alpha=0.3)
 
@@ -239,26 +271,37 @@ def plot_results(runs, stats):
     plt.close()
 
 def print_summary(stats):
-    def fmt(s):
-        return f"{s['final_accuracy_mean']:.4f} ± {s['final_accuracy_std']:.4f}"
+    def fmt(m):
+        return f"{m['mean']:.4f} ± {m['std']:.4f}"
 
+    baseline = stats[BASELINE['name']]
     print("\n" + "=" * 70)
-    print("EXPERIMENT SUMMARY")
+    print("EXPERIMENT SUMMARY (test split, mean ± std over seeds)")
     print("=" * 70)
-    print(f"Configuration: {NUM_CLIENTS} clients, {NUM_MALICIOUS} malicious, "
-          f"seeds {stats[BASELINE['name']]['seeds']}")
-    print(f"Baseline Accuracy (No Attack): {fmt(stats[BASELINE['name']])}")
-    print("\nAttack Strength Results:")
-    print("-" * 60)
-    print(f"{'Strength':<10} {'Accuracy (mean ± std)':<24} {'Attack Magnitude':<20}")
-    print("-" * 60)
+    print(f"Configuration: {NUM_CLIENTS} clients, {NUM_MALICIOUS} malicious, seeds {baseline['seeds']}")
+    print(f"Baseline (No Attack): acc {fmt(baseline['test_accuracy'])}, "
+          f"balanced {fmt(baseline['test_balanced_accuracy'])}")
+    print("\nAttack Strength Results (FedAvg):")
+    print("-" * 70)
+    print(f"{'Strength':<10} {'Accuracy':<20} {'Balanced accuracy':<20} {'Attack magnitude':<18}")
+    print("-" * 70)
     for spec, z in zip(ATTACK_SWEEP, ATTACK_STRENGTHS):
         s = stats[spec['name']]
-        print(f"z={z:<8} {fmt(s):<24} {s['stealthiness_mean']:.2f} ± {s['stealthiness_std']:.2f}")
+        print(f"z={z:<8} {fmt(s['test_accuracy']):<20} {fmt(s['test_balanced_accuracy']):<20} "
+              f"{s['stealthiness']['mean']:.2f} ± {s['stealthiness']['std']:.2f}")
     print(f"\nDefense Results (Attack Strength = {DEFENSE_ATTACK_STRENGTH}):")
     for spec in DEFENSE_COMPARISON:
+        s = stats[spec['name']]
         label = DEFENSE_LABELS[spec['defense']['name']] + ':'
-        print(f"  {label:<22}{fmt(stats[spec['name']])}")
+        line = (f"  {label:<22}acc {fmt(s['test_accuracy'])}, "
+                f"balanced {fmt(s['test_balanced_accuracy'])}")
+        if s['detection_tpr'] is not None:
+            line += (f", detection TPR {fmt(s['detection_tpr'])}"
+                     f", FPR {fmt(s['detection_fpr'])}")
+        print(line)
+    nonfinite = sum(s['test_nonfinite_samples'] for s in stats.values())
+    if nonfinite:
+        print(f"\nWARNING: {nonfinite} test predictions came from non-finite logits")
     print(f"\n✅ Results saved to {RESULTS_DIR} and {os.path.join(PLOTS_DIR, 'experiment_results.png')}")
 
 def build_config(args):
@@ -275,6 +318,8 @@ def build_config(args):
                       'state': 'reset every round'},
         'model': {'name': 'MedicalCNN', 'norm': 'GroupNorm(8)'},
         'partition': PARTITION,
+        'evaluation': 'validation split every round; test split once after the final round',
+        'detection': 'clients a defense did not keep count as flagged (Krum keeps one)',
         'seeds': args.seeds,
         'git': get_git_info()
     }

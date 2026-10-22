@@ -20,6 +20,7 @@ from attacks.reversed_scaled_attack import reversed_scaled_attack
 from defenses.aggregation import fedavg_aggregate, trimmed_mean_aggregate, krum_aggregate, krum_scores, aggregate
 from models.cnn_model import get_model
 from utils.data_utils import FLClient
+from utils.metrics import classification_metrics, confusion_matrix, detection_rates
 import run_experiment as rx
 
 def weights(*values):
@@ -129,6 +130,37 @@ def test_attack_registry_matches_direct_call():
     with pytest.raises(ValueError):
         apply_attack('no_such_attack', g, w)
 
+def test_confusion_matrix_and_class_metrics():
+    y_true = [0, 0, 0, 0, 1, 1, 2, 2]
+    y_pred = [0, 0, 0, 1, 1, 0, 2, 2]
+    cm = confusion_matrix(y_true, y_pred, num_classes=3)
+    assert cm.tolist() == [[3, 1, 0], [1, 1, 0], [0, 0, 2]]
+    m = classification_metrics(cm)
+    assert m['accuracy'] == 6 / 8
+    assert m['per_class_recall'] == [0.75, 0.5, 1.0]
+    assert m['balanced_accuracy'] == pytest.approx((0.75 + 0.5 + 1.0) / 3)
+    assert 'attack_success_rate' not in m  # untargeted
+
+def test_balanced_accuracy_ignores_absent_classes():
+    m = classification_metrics([[2, 0, 0], [0, 0, 0], [1, 0, 1]])
+    assert m['per_class_recall'] == [1.0, None, 0.5]
+    assert m['balanced_accuracy'] == 0.75
+
+def test_attack_success_rate_excludes_target_class_samples():
+    # Target class 1: its own samples (row 1) must not count, whatever they are predicted as
+    cm = [[6, 2, 0],
+          [0, 5, 0],
+          [1, 1, 2]]
+    m = classification_metrics(cm, target_class=1)
+    assert m['attack_success_rate'] == 3 / 12
+
+def test_detection_rates():
+    participants, malicious = list(range(20)), {0, 1, 2, 3}
+    assert detection_rates([7], participants, malicious) == {'tpr': 1.0, 'fpr': 15 / 16}
+    assert detection_rates([0], participants, malicious) == {'tpr': 0.75, 'fpr': 1.0}
+    assert detection_rates([7], participants, set()) == {'tpr': None, 'fpr': 19 / 20}
+    assert detection_rates(None, participants, malicious) is None
+
 # ---------- End-to-end checks on BloodMNIST (short runs) ----------
 
 @pytest.fixture(scope='module')
@@ -156,11 +188,22 @@ def test_baseline_has_no_attackers(short_runs):
     assert short_runs['a']['malicious_ids'] == [0, 1, 2, 3]
 
 def test_run_records_which_clients_each_defense_kept(short_runs):
-    assert short_runs['a']['accepted_clients'] == [None]  # FedAvg keeps no whole-client selection
-    (kept,) = short_runs['krum']['accepted_clients']
+    (fedavg_round,) = short_runs['a']['history']
+    assert fedavg_round['kept_clients'] is None and fedavg_round['detection'] is None
+    (krum_round,) = short_runs['krum']['history']
+    kept = krum_round['kept_clients']
     assert len(kept) == 1 and 0 <= kept[0] < rx.NUM_CLIENTS
+    expected = detection_rates(kept, range(rx.NUM_CLIENTS), short_runs['krum']['malicious_ids'])
+    assert krum_round['detection'] == expected
 
-def test_server_side_tensors_are_on_cpu(monkeypatch):
+def test_run_reports_final_test_metrics(short_runs):
+    test = short_runs['a']['test']
+    cm = test['confusion_matrix']
+    assert len(cm) == 8 and sum(map(sum, cm)) == 3421  # whole BloodMNIST test split
+    assert test['nonfinite_samples'] == 0
+    assert test['balanced_accuracy'] == pytest.approx(classification_metrics(cm)['balanced_accuracy'])
+
+def test_run_wiring_devices_counts_and_splits(monkeypatch):
     # Client updates live on CPU, so a CUDA global state would crash the attack and aggregation.
     # Only catches a regression when CUDA is available; on CPU-only machines it passes trivially.
     devices = set()
@@ -177,14 +220,22 @@ def test_server_side_tensors_are_on_cpu(monkeypatch):
         record(*ws)
         reported_counts.append(ns)
         return real_aggregate(name, ws, ns, f, **params)
+    evaluated_splits = []
+    real_evaluate = rx.evaluate
+    def evaluate(model, loader, *args):
+        evaluated_splits.append(loader.dataset.split)
+        return real_evaluate(model, loader, *args)
     monkeypatch.setattr(rx, 'apply_attack', attack)
     monkeypatch.setattr(rx, 'aggregate', aggregate)
+    monkeypatch.setattr(rx, 'evaluate', evaluate)
     
-    result = rx.run_experiment(rx.make_spec('fedavg', 3.0), seed=0, num_rounds=1)
+    result = rx.run_experiment(rx.make_spec('fedavg', 3.0), seed=0, num_rounds=2)
     assert devices == {'cpu'}
+    # Validation every round, test exactly once at the end
+    assert evaluated_splits == ['val', 'val', 'test']
     # The aggregator receives every active client's true sample count
     active_sizes = [n for n in result['client_sizes'] if n >= rx.PARTITION['min_samples']]
-    assert reported_counts == [active_sizes]
+    assert reported_counts == [active_sizes, active_sizes]
 
 def test_pipeline_writes_results(tmp_path, monkeypatch):
     monkeypatch.setattr(rx, 'RESULTS_DIR', str(tmp_path / 'results'))

@@ -91,14 +91,20 @@ class FLClient:
         return self.get_weights()
 
 def load_data():
-    """Load BloodMNIST dataset"""
+    """
+    Load BloodMNIST with its official splits. The validation split is for
+    monitoring and tuning; the test split should be evaluated once, at the end.
+    """
     print("Loading BloodMNIST dataset...")
     train_data = TransformedBloodMNIST(split='train', download=True, size=28)
+    val_data = TransformedBloodMNIST(split='val', download=True, size=28)
     test_data = TransformedBloodMNIST(split='test', download=True, size=28)
+    val_loader = DataLoader(val_data, batch_size=BATCH_SIZE)
     test_loader = DataLoader(test_data, batch_size=BATCH_SIZE)
     num_classes = len(INFO['bloodmnist']['label'])
-    print(f"  Training samples: {len(train_data)}, Classes: {num_classes}")
-    return train_data, test_loader, num_classes
+    print(f"  Training samples: {len(train_data)}, Validation: {len(val_data)}, "
+          f"Test: {len(test_data)}, Classes: {num_classes}")
+    return train_data, val_loader, test_loader, num_classes
 
 def partition_data(dataset, num_clients, partition, rng):
     """
