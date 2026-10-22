@@ -38,17 +38,20 @@ class TransformedBloodMNIST(BloodMNIST):
 
 class FLClient:
     """Federated Learning client with local training"""
-    def __init__(self, client_id, dataset, model, device, batch_size=32, local_epochs=2):
+    def __init__(self, client_id, dataset, model, device, batch_size=32, local_epochs=2, seed=None):
         self.client_id = client_id
         self.has_data = len(dataset) > 0
         self.device = device
         self.local_epochs = local_epochs
-        
+
         if not self.has_data:
             return
-            
+
         self.model = copy.deepcopy(model).to(device)
-        self.dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+        # Per-client generator so the shuffling order depends only on the seed
+        generator = torch.Generator().manual_seed(seed) if seed is not None else None
+        self.dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True,
+                                     generator=generator)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=0.001)
         self.criterion = torch.nn.CrossEntropyLoss()
         
@@ -91,17 +94,20 @@ def load_data():
     print(f"  Training samples: {len(train_data)}, Classes: {num_classes}")
     return train_data, test_loader, num_classes
 
-def create_non_iid_splits(dataset, num_clients, alpha=0.5, min_samples=30):
+def create_non_iid_splits(dataset, num_clients, alpha=0.5, min_samples=30, rng=None):
     """
     Create non-IID client splits using Dirichlet distribution.
-    
+
     Args:
         dataset: Training dataset
         num_clients: Number of clients
         alpha: Dirichlet concentration parameter (smaller = more non-IID)
         min_samples: Minimum samples per client
+        rng: NumPy Generator used for all sampling (pass a seeded one for reproducibility)
     """
     print("  Creating non-IID client splits...")
+    if rng is None:
+        rng = np.random.default_rng()
     
     # Extract labels
     labels = []
@@ -119,9 +125,9 @@ def create_non_iid_splits(dataset, num_clients, alpha=0.5, min_samples=30):
         client_indices = [[] for _ in range(num_clients)]
         
         for class_id in range(num_classes):
-            proportions = np.random.dirichlet([current_alpha] * num_clients)
+            proportions = rng.dirichlet([current_alpha] * num_clients)
             class_samples = class_indices[class_id].copy()
-            np.random.shuffle(class_samples)
+            rng.shuffle(class_samples)
             start = 0
             for client_id, prop in enumerate(proportions):
                 n = int(prop * len(class_samples))
