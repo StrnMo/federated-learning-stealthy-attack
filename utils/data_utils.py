@@ -100,6 +100,16 @@ def load_data():
     print(f"  Training samples: {len(train_data)}, Classes: {num_classes}")
     return train_data, test_loader, num_classes
 
+def partition_data(dataset, num_clients, partition, rng):
+    """
+    Split a dataset across clients according to a partition spec, e.g.
+    {'type': 'dirichlet', 'alpha': 0.5, 'min_samples': 30}.
+    """
+    if partition['type'] == 'dirichlet':
+        return create_non_iid_splits(dataset, num_clients, alpha=partition['alpha'],
+                                     min_samples=partition['min_samples'], rng=rng)
+    raise ValueError(f"Unknown partition type '{partition['type']}'")
+
 def create_non_iid_splits(dataset, num_clients, alpha=0.5, min_samples=30, rng=None):
     """
     Create non-IID client splits using Dirichlet distribution.

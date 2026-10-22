@@ -107,3 +107,33 @@ def krum_aggregate(client_weights, num_malicious=1):
         return None
     best_idx = int(np.argmin(krum_scores(client_weights, num_malicious)))
     return copy.deepcopy(client_weights[best_idx])
+
+# ---------- Uniform interface used by the experiment runner ----------
+# Each defense takes (client_weights, num_samples, num_malicious, **params) and returns
+# (aggregate, accepted): accepted lists the client positions the defense kept, or is None
+# for defenses that do not select or remove whole clients.
+
+def _fedavg(client_weights, num_samples, num_malicious):
+    return fedavg_aggregate(client_weights, num_samples), None
+
+def _trimmed_mean(client_weights, num_samples, num_malicious, trim_ratio=0.2):
+    # Coordinate-wise: no client is removed as a whole
+    return trimmed_mean_aggregate(client_weights, trim_ratio), None
+
+def _krum(client_weights, num_samples, num_malicious, f=None):
+    # f is the defender's assumed number of attackers; defaults to the true number
+    f = num_malicious if f is None else f
+    best_idx = int(np.argmin(krum_scores(client_weights, f)))
+    return copy.deepcopy(client_weights[best_idx]), [best_idx]
+
+DEFENSES = {
+    'fedavg': _fedavg,
+    'trimmed_mean': _trimmed_mean,
+    'krum': _krum,
+}
+
+def aggregate(name, client_weights, num_samples, num_malicious, **params):
+    """Aggregate with the named defense; returns (aggregate, accepted client positions or None)"""
+    if name not in DEFENSES:
+        raise ValueError(f"Unknown defense '{name}' (known: {sorted(DEFENSES)})")
+    return DEFENSES[name](client_weights, num_samples, num_malicious, **params)

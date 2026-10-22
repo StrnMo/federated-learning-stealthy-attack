@@ -15,8 +15,9 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 sys.path.insert(0, os.path.join(REPO_ROOT, 'experiments'))
 
+from attacks import apply_attack
 from attacks.reversed_scaled_attack import reversed_scaled_attack
-from defenses.aggregation import fedavg_aggregate, trimmed_mean_aggregate, krum_aggregate, krum_scores
+from defenses.aggregation import fedavg_aggregate, trimmed_mean_aggregate, krum_aggregate, krum_scores, aggregate
 from models.cnn_model import get_model
 from utils.data_utils import FLClient
 import run_experiment as rx
@@ -112,15 +113,33 @@ def test_local_update_ignores_previous_rounds():
     a, b = updates
     assert all(torch.equal(a[k], b[k]) for k in a)
 
+def test_defense_registry_reports_kept_clients():
+    clients = [weights(float(x), float(y)) for x, y in KRUM_POINTS]
+    _, kept = aggregate('krum', clients, [10] * 6, 1)
+    assert kept == [0]
+    _, kept = aggregate('trimmed_mean', clients, [10] * 6, 1, trim_ratio=0.2)
+    assert kept is None
+    with pytest.raises(ValueError):
+        aggregate('no_such_defense', clients, [10] * 6, 1)
+
+def test_attack_registry_matches_direct_call():
+    g, w = weights(1.0, 2.0), weights(1.5, 1.0)
+    assert torch.equal(apply_attack('reversed_scaled', g, w, scale=3.0)['w'],
+                       reversed_scaled_attack(g, w, scale=3.0)['w'])
+    with pytest.raises(ValueError):
+        apply_attack('no_such_attack', g, w)
+
 # ---------- End-to-end checks on BloodMNIST (short runs) ----------
 
 @pytest.fixture(scope='module')
 def short_runs():
+    attacked = rx.make_spec('fedavg', 3.0)
     return {
-        'a': rx.run_experiment(3.0, 'fedavg', seed=0, num_rounds=1),
-        'b': rx.run_experiment(3.0, 'fedavg', seed=0, num_rounds=1),
-        'c': rx.run_experiment(1.0, 'fedavg', seed=0, num_rounds=1),
-        'd': rx.run_experiment(1.0, 'fedavg', seed=1, num_rounds=1),
+        'a': rx.run_experiment(attacked, seed=0, num_rounds=1),
+        'b': rx.run_experiment(attacked, seed=0, num_rounds=1),
+        'c': rx.run_experiment(rx.BASELINE, seed=0, num_rounds=1),
+        'd': rx.run_experiment(rx.BASELINE, seed=1, num_rounds=1),
+        'krum': rx.run_experiment(rx.make_spec('krum', 3.0), seed=0, num_rounds=1),
     }
 
 def test_same_seed_and_config_is_identical(short_runs):
@@ -132,6 +151,15 @@ def test_same_seed_gives_same_partition_across_configs(short_runs):
 def test_different_seed_gives_different_partition(short_runs):
     assert short_runs['c']['client_sizes'] != short_runs['d']['client_sizes']
 
+def test_baseline_has_no_attackers(short_runs):
+    assert short_runs['c']['malicious_ids'] == []
+    assert short_runs['a']['malicious_ids'] == [0, 1, 2, 3]
+
+def test_run_records_which_clients_each_defense_kept(short_runs):
+    assert short_runs['a']['accepted_clients'] == [None]  # FedAvg keeps no whole-client selection
+    (kept,) = short_runs['krum']['accepted_clients']
+    assert len(kept) == 1 and 0 <= kept[0] < rx.NUM_CLIENTS
+
 def test_server_side_tensors_are_on_cpu(monkeypatch):
     # Client updates live on CPU, so a CUDA global state would crash the attack and aggregation.
     # Only catches a regression when CUDA is available; on CPU-only machines it passes trivially.
@@ -139,17 +167,23 @@ def test_server_side_tensors_are_on_cpu(monkeypatch):
     def record(*dicts):
         for d in dicts:
             devices.update(v.device.type for v in d.values())
-
-    real_attack, real_fedavg = rx.reversed_scaled_attack, rx.fedavg_aggregate
-    monkeypatch.setattr(rx, 'reversed_scaled_attack',
-                        lambda g, w, z: (record(g, w), real_attack(g, w, z))[1])
+    
+    real_attack, real_aggregate = rx.apply_attack, rx.aggregate
+    def attack(name, g, w, **params):
+        record(g, w)
+        return real_attack(name, g, w, **params)
     reported_counts = []
-    monkeypatch.setattr(rx, 'fedavg_aggregate',
-                        lambda ws, ns: (record(*ws), reported_counts.append(ns), real_fedavg(ws, ns))[2])
-    result = rx.run_experiment(3.0, 'fedavg', seed=0, num_rounds=1)
+    def aggregate(name, ws, ns, f, **params):
+        record(*ws)
+        reported_counts.append(ns)
+        return real_aggregate(name, ws, ns, f, **params)
+    monkeypatch.setattr(rx, 'apply_attack', attack)
+    monkeypatch.setattr(rx, 'aggregate', aggregate)
+    
+    result = rx.run_experiment(rx.make_spec('fedavg', 3.0), seed=0, num_rounds=1)
     assert devices == {'cpu'}
-    # FedAvg receives every active client's true sample count
-    active_sizes = [n for n in result['client_sizes'] if n >= rx.MIN_SAMPLES_PER_CLIENT]
+    # The aggregator receives every active client's true sample count
+    active_sizes = [n for n in result['client_sizes'] if n >= rx.PARTITION['min_samples']]
     assert reported_counts == [active_sizes]
 
 def test_pipeline_writes_results(tmp_path, monkeypatch):
@@ -157,11 +191,13 @@ def test_pipeline_writes_results(tmp_path, monkeypatch):
     monkeypatch.setattr(rx, 'PLOTS_DIR', str(tmp_path / 'plots'))
     monkeypatch.setattr(sys, 'argv', ['run_experiment.py', '--seeds', '0', '1', '--rounds', '1'])
     rx.main()
-
+    
     files = set(os.listdir(tmp_path / 'results'))
-    expected = {f'seed{s}_{rx.config_name(*cfg)}.json' for s in (0, 1) for cfg in rx.CONFIGS}
+    expected = {f"seed{s}_{spec['name']}.json" for s in (0, 1) for spec in rx.CONFIGS}
     assert expected | {'summary.json'} == files
     assert (tmp_path / 'plots' / 'experiment_results.png').exists()
-
+    
     summary = json.loads((tmp_path / 'results' / 'summary.json').read_text())
-    assert summary['summary'][rx.config_name(*rx.BASELINE)]['num_seeds'] == 2
+    assert summary['summary'][rx.BASELINE['name']]['num_seeds'] == 2
+    run = json.loads((tmp_path / 'results' / f"seed0_{rx.BASELINE['name']}.json").read_text())
+    assert run['spec'] == rx.BASELINE and run['config']['partition'] == rx.PARTITION

@@ -14,9 +14,9 @@ import matplotlib.pyplot as plt
 from torch.utils.data import Subset
 
 from models.cnn_model import get_model
-from attacks.reversed_scaled_attack import reversed_scaled_attack
-from defenses.aggregation import fedavg_aggregate, trimmed_mean_aggregate, krum_aggregate
-from utils.data_utils import load_data, create_non_iid_splits, FLClient, DEVICE
+from attacks import apply_attack
+from defenses.aggregation import aggregate
+from utils.data_utils import load_data, partition_data, FLClient, DEVICE
 from utils.metrics import compute_stealthiness, evaluate_model
 from utils.reproducibility import set_seed, get_git_info, save_results
 
@@ -28,8 +28,7 @@ LOCAL_EPOCHS = 2
 BATCH_SIZE = 32
 LEARNING_RATE = 0.01  # client SGD; not yet tuned on the validation split
 MOMENTUM = 0.9
-MIN_SAMPLES_PER_CLIENT = 30
-DIRICHLET_ALPHA = 0.5
+PARTITION = {'type': 'dirichlet', 'alpha': 0.5, 'min_samples': 30}
 ATTACK_STRENGTHS = [1.5, 2.0, 3.0, 5.0]
 DEFENSE_ATTACK_STRENGTH = 3.0  # must be in ATTACK_STRENGTHS so its FedAvg run is shared
 SEEDS = [0, 1, 2, 3, 4]
@@ -37,32 +36,49 @@ SEEDS = [0, 1, 2, 3, 4]
 PLOTS_DIR = os.path.join(REPO_ROOT, 'plots')
 RESULTS_DIR = os.path.join(REPO_ROOT, 'results')
 
-# Each (attack_strength, defense) pair is run once per seed; z=1.0 is the no-attack baseline
-BASELINE = (1.0, 'fedavg')
-CONFIGS = ([BASELINE]
-           + [(z, 'fedavg') for z in ATTACK_STRENGTHS]
-           + [(DEFENSE_ATTACK_STRENGTH, 'trimmed_mean'), (DEFENSE_ATTACK_STRENGTH, 'krum')])
-
-def run_experiment(attack_strength, defense='fedavg', seed=0, num_rounds=NUM_ROUNDS):
+def make_spec(defense, scale=None, **defense_params):
     """
-    Run single FL experiment with given attack strength, defense and seed.
+    One experiment configuration. attack is None for the no-attack baseline;
+    target_class is reserved for targeted attacks (None = untargeted).
+    """
+    attack = None
+    name = f'{defense}_no_attack'
+    if scale is not None:
+        attack = {'name': 'reversed_scaled', 'params': {'scale': scale}, 'target_class': None}
+        name = f'{defense}_reversed_scaled_z{scale}'
+    return {'name': name, 'attack': attack,
+            'defense': {'name': defense, 'params': defense_params}}
+
+BASELINE = make_spec('fedavg')
+ATTACK_SWEEP = [make_spec('fedavg', z) for z in ATTACK_STRENGTHS]
+DEFENSE_COMPARISON = [make_spec('fedavg', DEFENSE_ATTACK_STRENGTH),
+                      make_spec('trimmed_mean', DEFENSE_ATTACK_STRENGTH, trim_ratio=0.2),
+                      make_spec('krum', DEFENSE_ATTACK_STRENGTH)]  # Krum f = true #malicious
+DEFENSE_LABELS = {'fedavg': 'FedAvg (No Defense)', 'trimmed_mean': 'Trimmed Mean', 'krum': 'Krum'}
+
+# Every distinct spec is run once per seed (FedAvg at z=3 is shared by sweep and comparison)
+CONFIGS = list({s['name']: s for s in [BASELINE] + ATTACK_SWEEP + DEFENSE_COMPARISON}.values())
+
+def run_experiment(spec, seed=0, num_rounds=NUM_ROUNDS):
+    """
+    Run single FL experiment for one spec and seed.
 
     Reseeding at the start makes the data partition, model initialisation and
     client shuffling identical for every configuration that shares a seed.
     """
     set_seed(seed)
+    attack, defense = spec['attack'], spec['defense']
 
     # Load data
     train_data, test_loader, num_classes = load_data()
-    client_indices = create_non_iid_splits(train_data, NUM_CLIENTS, alpha=DIRICHLET_ALPHA,
-                                           min_samples=MIN_SAMPLES_PER_CLIENT,
-                                           rng=np.random.default_rng(seed))
+    client_indices = partition_data(train_data, NUM_CLIENTS, PARTITION,
+                                    rng=np.random.default_rng(seed))
 
     # Initialize clients
     base_model = get_model(num_classes, input_channels=3).to(DEVICE)
     clients = []
     for i, indices in enumerate(client_indices):
-        if len(indices) >= MIN_SAMPLES_PER_CLIENT:
+        if len(indices) >= PARTITION['min_samples']:
             subset = Subset(train_data, indices)
             clients.append(FLClient(i, subset, copy.deepcopy(base_model), DEVICE,
                                     BATCH_SIZE, LOCAL_EPOCHS, seed=seed * 1000 + i,
@@ -78,7 +94,8 @@ def run_experiment(attack_strength, defense='fedavg', seed=0, num_rounds=NUM_ROU
         raise RuntimeError(f"Only {num_valid_clients} clients have enough data (seed {seed})")
 
     actual_malicious = min(NUM_MALICIOUS, max(2, num_valid_clients // 5))
-    print(f"  Malicious clients: {actual_malicious}")
+    malicious_ids = set(range(actual_malicious)) if attack is not None else set()
+    print(f"  Malicious clients: {sorted(malicious_ids)}")
 
     # Initialize global model; the server keeps its weights on CPU, like the client updates
     global_model = copy.deepcopy(base_model)
@@ -86,16 +103,15 @@ def run_experiment(attack_strength, defense='fedavg', seed=0, num_rounds=NUM_ROU
 
     accuracies = []
     stealthiness_scores = []
+    accepted_per_round = []  # client ids each defense kept (None if it keeps no whole clients)
 
     # Federated training rounds
     for round_idx in range(num_rounds):
         client_weights = []
         client_num_samples = []  # malicious clients report their true sample counts
+        client_ids = []
 
-        for i, client in enumerate(clients):
-            if client is None or not client.has_data:
-                continue
-
+        for client in active_clients:
             # Local training
             client.set_weights(copy.deepcopy(global_weights))
             honest_weights = client.train()
@@ -103,12 +119,11 @@ def run_experiment(attack_strength, defense='fedavg', seed=0, num_rounds=NUM_ROU
             if honest_weights is None:
                 continue
             client_num_samples.append(client.num_samples)
+            client_ids.append(client.client_id)
 
-            # Apply attack if malicious
-            is_malicious = (i < actual_malicious and attack_strength > 1.0)
-
-            if is_malicious:
-                poisoned = reversed_scaled_attack(global_weights, honest_weights, attack_strength)
+            if client.client_id in malicious_ids:
+                poisoned = apply_attack(attack['name'], global_weights, honest_weights,
+                                        **attack['params'])
                 client_weights.append(poisoned)
                 stealthiness_scores.append(compute_stealthiness(global_weights, poisoned))
             else:
@@ -117,35 +132,29 @@ def run_experiment(attack_strength, defense='fedavg', seed=0, num_rounds=NUM_ROU
         if len(client_weights) == 0:
             continue
 
-        # Aggregate updates
-        if defense == 'trimmed_mean':
-            global_weights = trimmed_mean_aggregate(client_weights)
-        elif defense == 'krum':
-            global_weights = krum_aggregate(client_weights, actual_malicious)
-        else:  # fedavg
-            global_weights = fedavg_aggregate(client_weights, client_num_samples)
+        # Aggregate updates; defenses that need f assume the configured number of attackers
+        global_weights, accepted = aggregate(defense['name'], client_weights, client_num_samples,
+                                             actual_malicious, **defense['params'])
+        accepted_per_round.append(None if accepted is None else [client_ids[j] for j in accepted])
 
-        if global_weights is not None:
-            global_model.load_state_dict(global_weights)
-            acc = evaluate_model(global_model, test_loader, DEVICE)
-            accuracies.append(acc)
+        global_model.load_state_dict(global_weights)
+        acc = evaluate_model(global_model, test_loader, DEVICE)
+        accuracies.append(acc)
 
-            if (round_idx + 1) % 10 == 0:
-                print(f"    Round {round_idx + 1}: Acc = {acc:.4f}")
+        if (round_idx + 1) % 10 == 0:
+            print(f"    Round {round_idx + 1}: Acc = {acc:.4f}")
 
     return {
-        'attack_strength': attack_strength,
-        'defense': defense,
+        'spec': spec,
         'seed': seed,
-        'num_malicious': actual_malicious,
+        'num_malicious': len(malicious_ids),
+        'malicious_ids': sorted(malicious_ids),
         'client_sizes': [len(idx) for idx in client_indices],
         'final_accuracy': accuracies[-1] if accuracies else 0,
         'stealthiness': float(np.mean(stealthiness_scores)) if stealthiness_scores else 0.0,
-        'accuracies': accuracies
+        'accuracies': accuracies,
+        'accepted_clients': accepted_per_round
     }
-
-def config_name(attack_strength, defense):
-    return f'{defense}_z{attack_strength}'
 
 def summarise(runs):
     """Mean and sample std over seeds of the final accuracy and stealthiness"""
@@ -168,10 +177,10 @@ def plot_results(runs, stats):
     """Generate comprehensive results plots (mean ± std over seeds)"""
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
-    baseline = stats[BASELINE]
+    baseline = stats[BASELINE['name']]
     baseline_label = (f'Baseline: {baseline["final_accuracy_mean"]:.3f} '
                       f'± {baseline["final_accuracy_std"]:.3f}')
-    attack_stats = [stats[(z, 'fedavg')] for z in ATTACK_STRENGTHS]
+    attack_stats = [stats[s['name']] for s in ATTACK_SWEEP]
 
     # Plot 1: Accuracy vs Attack Strength
     axes[0, 0].errorbar(ATTACK_STRENGTHS, [s['final_accuracy_mean'] for s in attack_stats],
@@ -195,8 +204,8 @@ def plot_results(runs, stats):
     axes[0, 1].grid(True, alpha=0.3)
 
     # Plot 3: Defense Comparison
-    defense_names = ['FedAvg (No Defense)', 'Trimmed Mean', 'Krum']
-    defense_stats = [stats[(DEFENSE_ATTACK_STRENGTH, d)] for d in ['fedavg', 'trimmed_mean', 'krum']]
+    defense_names = [DEFENSE_LABELS[s['defense']['name']] for s in DEFENSE_COMPARISON]
+    defense_stats = [stats[s['name']] for s in DEFENSE_COMPARISON]
     defense_means = [s['final_accuracy_mean'] for s in defense_stats]
     defense_stds = [s['final_accuracy_std'] for s in defense_stats]
     bars = axes[1, 0].bar(defense_names, defense_means, yerr=defense_stds, capsize=6,
@@ -213,9 +222,9 @@ def plot_results(runs, stats):
                        f'{mean:.3f}', ha='center', fontsize=9)
 
     # Plot 4: Training Progress
-    for strength in ATTACK_STRENGTHS[:3]:
-        plot_curve(axes[1, 1], runs[(strength, 'fedavg')], f'z={strength}', '-')
-    plot_curve(axes[1, 1], runs[BASELINE], 'Baseline', 'g--')
+    for s, strength in zip(ATTACK_SWEEP[:3], ATTACK_STRENGTHS[:3]):
+        plot_curve(axes[1, 1], runs[s['name']], f'z={strength}', '-')
+    plot_curve(axes[1, 1], runs[BASELINE['name']], 'Baseline', 'g--')
     axes[1, 1].set_xlabel('Round')
     axes[1, 1].set_ylabel('Accuracy')
     axes[1, 1].set_title('Training Progress Over Rounds')
@@ -237,20 +246,38 @@ def print_summary(stats):
     print("EXPERIMENT SUMMARY")
     print("=" * 70)
     print(f"Configuration: {NUM_CLIENTS} clients, {NUM_MALICIOUS} malicious, "
-          f"seeds {stats[BASELINE]['seeds']}")
-    print(f"Baseline Accuracy (No Attack): {fmt(stats[BASELINE])}")
+          f"seeds {stats[BASELINE['name']]['seeds']}")
+    print(f"Baseline Accuracy (No Attack): {fmt(stats[BASELINE['name']])}")
     print("\nAttack Strength Results:")
     print("-" * 60)
     print(f"{'Strength':<10} {'Accuracy (mean ± std)':<24} {'Attack Magnitude':<20}")
     print("-" * 60)
-    for z in ATTACK_STRENGTHS:
-        s = stats[(z, 'fedavg')]
+    for spec, z in zip(ATTACK_SWEEP, ATTACK_STRENGTHS):
+        s = stats[spec['name']]
         print(f"z={z:<8} {fmt(s):<24} {s['stealthiness_mean']:.2f} ± {s['stealthiness_std']:.2f}")
     print(f"\nDefense Results (Attack Strength = {DEFENSE_ATTACK_STRENGTH}):")
-    print(f"  FedAvg (No Defense):  {fmt(stats[(DEFENSE_ATTACK_STRENGTH, 'fedavg')])}")
-    print(f"  Trimmed Mean:         {fmt(stats[(DEFENSE_ATTACK_STRENGTH, 'trimmed_mean')])}")
-    print(f"  Krum:                 {fmt(stats[(DEFENSE_ATTACK_STRENGTH, 'krum')])}")
+    for spec in DEFENSE_COMPARISON:
+        label = DEFENSE_LABELS[spec['defense']['name']] + ':'
+        print(f"  {label:<22}{fmt(stats[spec['name']])}")
     print(f"\n✅ Results saved to {RESULTS_DIR} and {os.path.join(PLOTS_DIR, 'experiment_results.png')}")
+
+def build_config(args):
+    """Settings shared by every run, stored alongside each result"""
+    return {
+        'num_clients': NUM_CLIENTS,
+        'num_rounds': args.rounds,
+        'num_malicious': NUM_MALICIOUS,
+        'malicious_clients': 'client ids 0..num_malicious-1, attacking every round',
+        'fedavg_weighting': 'client sample count (malicious clients report true counts)',
+        'local_epochs': LOCAL_EPOCHS,
+        'batch_size': BATCH_SIZE,
+        'optimizer': {'name': 'sgd', 'lr': LEARNING_RATE, 'momentum': MOMENTUM,
+                      'state': 'reset every round'},
+        'model': {'name': 'MedicalCNN', 'norm': 'GroupNorm(8)'},
+        'partition': PARTITION,
+        'seeds': args.seeds,
+        'git': get_git_info()
+    }
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -263,20 +290,7 @@ def main():
     # Windows consoles and redirected logs default to cp1252, which cannot encode ✅
     sys.stdout.reconfigure(encoding='utf-8')
     args = parse_args()
-    config = {
-        'num_clients': NUM_CLIENTS,
-        'num_rounds': args.rounds,
-        'num_malicious': NUM_MALICIOUS,
-        'fedavg_weighting': 'client sample count (malicious clients report true counts)',
-        'local_epochs': LOCAL_EPOCHS,
-        'batch_size': BATCH_SIZE,
-        'optimizer': {'name': 'sgd', 'lr': LEARNING_RATE, 'momentum': MOMENTUM,
-                      'state': 'reset every round'},
-        'min_samples_per_client': MIN_SAMPLES_PER_CLIENT,
-        'dirichlet_alpha': DIRICHLET_ALPHA,
-        'seeds': args.seeds,
-        'git': get_git_info()
-    }
+    config = build_config(args)
 
     print("=" * 70)
     print("MODEL POISONING ATTACK EXPERIMENT")
@@ -284,19 +298,17 @@ def main():
           f"Seeds: {args.seeds}")
     print("=" * 70)
 
-    runs = {cfg: [] for cfg in CONFIGS}
+    runs = {spec['name']: [] for spec in CONFIGS}
     for seed in args.seeds:
-        for attack_strength, defense in CONFIGS:
-            label = 'No attack' if (attack_strength, defense) == BASELINE else f'z={attack_strength}'
-            print(f"\n[seed {seed}] {defense}, {label}")
-            result = run_experiment(attack_strength, defense, seed, args.rounds)
-            runs[(attack_strength, defense)].append(result)
-            save_results(os.path.join(RESULTS_DIR, f'seed{seed}_{config_name(attack_strength, defense)}.json'),
+        for spec in CONFIGS:
+            print(f"\n[seed {seed}] {spec['name']}")
+            result = run_experiment(spec, seed, args.rounds)
+            runs[spec['name']].append(result)
+            save_results(os.path.join(RESULTS_DIR, f"seed{seed}_{spec['name']}.json"),
                          {'config': config, **result})
 
-    stats = {cfg: summarise(r) for cfg, r in runs.items()}
-    save_results(os.path.join(RESULTS_DIR, 'summary.json'),
-                 {'config': config, 'summary': {config_name(*cfg): s for cfg, s in stats.items()}})
+    stats = {name: summarise(r) for name, r in runs.items()}
+    save_results(os.path.join(RESULTS_DIR, 'summary.json'), {'config': config, 'summary': stats})
 
     plot_results(runs, stats)
     print_summary(stats)
