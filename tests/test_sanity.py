@@ -255,18 +255,47 @@ def test_run_wiring_devices_counts_and_splits(monkeypatch):
     active_sizes = [n for n in result['client_sizes'] if n >= rx.PARTITION['min_samples']]
     assert reported_counts == [active_sizes, active_sizes]
 
-def test_pipeline_writes_results(tmp_path, monkeypatch):
-    monkeypatch.setattr(rx, 'RESULTS_DIR', str(tmp_path / 'results'))
-    monkeypatch.setattr(rx, 'PLOTS_DIR', str(tmp_path / 'plots'))
-    monkeypatch.setattr(sys, 'argv', ['run_experiment.py', '--seeds', '0', '1', '--rounds', '1'])
-    rx.main()
-    
-    files = set(os.listdir(tmp_path / 'results'))
+def test_pipeline_writes_results_and_resumes(tmp_path, monkeypatch):
+    results, plots = tmp_path / 'results', tmp_path / 'plots'
+    def main(*args):
+        monkeypatch.setattr(sys, 'argv', ['run_experiment.py', '--results-dir', str(results),
+                                          '--plots-dir', str(plots), *args])
+        rx.main()
+
+    # Fresh run writes every (seed, spec) file, the summary and the plot
+    main('--seeds', '0', '1', '--rounds', '1')
     expected = {f"seed{s}_{spec['name']}.json" for s in (0, 1) for spec in rx.CONFIGS}
-    assert expected | {'summary.json'} == files
-    assert (tmp_path / 'plots' / 'experiment_results.png').exists()
-    
-    summary = json.loads((tmp_path / 'results' / 'summary.json').read_text())
+    assert set(os.listdir(results)) == expected | {'summary.json'}
+    assert (plots / 'experiment_results.png').exists()
+    summary = json.loads((results / 'summary.json').read_text())
     assert summary['summary'][rx.BASELINE['name']]['num_seeds'] == 2
-    run = json.loads((tmp_path / 'results' / f"seed0_{rx.BASELINE['name']}.json").read_text())
+    run = json.loads((results / f"seed0_{rx.BASELINE['name']}.json").read_text())
     assert run['spec'] == rx.BASELINE and run['config']['partition'] == rx.PARTITION
+
+    # --summary-only trains nothing and rebuilds the same summary from the saved runs
+    real_run = rx.run_experiment
+    trained = []
+    def counting_run(spec, seed, num_rounds):
+        trained.append((seed, spec['name']))
+        return real_run(spec, seed, num_rounds)
+    monkeypatch.setattr(rx, 'run_experiment', counting_run)
+    (results / 'summary.json').unlink()
+    main('--seeds', '0', '1', '--rounds', '1', '--summary-only')
+    assert trained == []
+    assert json.loads((results / 'summary.json').read_text())['summary'] == summary['summary']
+
+    # Resume: only the missing run is trained; --skip-summary writes no summary
+    missing = rx.CONFIGS[-1]
+    (results / f"seed1_{missing['name']}.json").unlink()
+    (results / 'summary.json').unlink()
+    main('--seeds', '1', '--rounds', '1', '--skip-summary')
+    assert trained == [(1, missing['name'])]
+    assert (results / f"seed1_{missing['name']}.json").exists()
+    assert not (results / 'summary.json').exists()
+    assert not any(name.endswith('.tmp') for name in os.listdir(results))
+
+    # Missing seeds and runs with different settings are errors, never silently mixed
+    with pytest.raises(FileNotFoundError):
+        main('--seeds', '0', '1', '2', '--rounds', '1', '--summary-only')
+    with pytest.raises(ValueError, match='num_rounds'):
+        main('--seeds', '0', '--rounds', '2', '--summary-only')

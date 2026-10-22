@@ -50,7 +50,13 @@ def get_environment_info(device):
     return info
 
 def save_results(path, results):
-    """Write a results dict to a JSON file, creating the directory if needed"""
+    """
+    Write a results dict to a JSON file, creating the directory if needed.
+    Writes to a temporary file first, so an interrupted run never leaves a
+    half-written file that a resumed run would mistake for a finished one.
+    """
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, 'w') as f:
+    tmp_path = path + '.tmp'
+    with open(tmp_path, 'w') as f:
         json.dump(results, f, indent=2)
+    os.replace(tmp_path, path)

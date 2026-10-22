@@ -9,6 +9,7 @@ sys.path.insert(0, REPO_ROOT)
 
 import argparse
 import copy
+import json
 import numpy as np
 import matplotlib.pyplot as plt
 from torch.utils.data import Subset
@@ -204,7 +205,7 @@ def plot_curve(ax, runs, label, style):
     line, = ax.plot(rounds, mean, style, label=label, linewidth=2)
     ax.fill_between(rounds, mean - std, mean + std, color=line.get_color(), alpha=0.2)
 
-def plot_results(runs, stats):
+def plot_results(runs, stats, plots_dir):
     """Generate comprehensive results plots (mean ± std over seeds)"""
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
@@ -266,11 +267,11 @@ def plot_results(runs, stats):
     plt.suptitle(f'Naive Reversed/Scaled Poisoning Attack, '
                  f'mean ± std over {baseline["num_seeds"]} seeds', fontsize=14)
     plt.tight_layout()
-    os.makedirs(PLOTS_DIR, exist_ok=True)
-    plt.savefig(os.path.join(PLOTS_DIR, 'experiment_results.png'), dpi=150, bbox_inches='tight')
+    os.makedirs(plots_dir, exist_ok=True)
+    plt.savefig(os.path.join(plots_dir, 'experiment_results.png'), dpi=150, bbox_inches='tight')
     plt.close()
 
-def print_summary(stats):
+def print_summary(stats, results_dir, plots_dir):
     def fmt(m):
         return f"{m['mean']:.4f} ± {m['std']:.4f}"
 
@@ -302,7 +303,7 @@ def print_summary(stats):
     nonfinite = sum(s['test_nonfinite_samples'] for s in stats.values())
     if nonfinite:
         print(f"\nWARNING: {nonfinite} test predictions came from non-finite logits")
-    print(f"\n✅ Results saved to {RESULTS_DIR} and {os.path.join(PLOTS_DIR, 'experiment_results.png')}")
+    print(f"\n✅ Results saved to {results_dir} and {os.path.join(plots_dir, 'experiment_results.png')}")
 
 def build_config(args):
     """Settings shared by every run, stored alongside each result"""
@@ -325,11 +326,49 @@ def build_config(args):
         'git': get_git_info()
     }
 
+# Config keys that may legitimately differ between runs that are summarised together
+RUN_SPECIFIC_CONFIG_KEYS = {'seeds', 'git', 'environment'}
+
+def result_path(results_dir, seed, spec):
+    return os.path.join(results_dir, f"seed{seed}_{spec['name']}.json")
+
+def load_result(path, spec, seed, config):
+    """
+    Load a saved run for resuming. Refuses results produced with different
+    experiment settings, so runs are never silently mixed; a different commit
+    or device only triggers a warning.
+    """
+    with open(path) as f:
+        result = json.load(f)
+    if result['spec'] != spec or result['seed'] != seed:
+        raise ValueError(f"{path} does not contain seed {seed} of {spec['name']}")
+    saved = result['config']
+    differing = sorted(k for k in set(saved) | set(config)
+                       if k not in RUN_SPECIFIC_CONFIG_KEYS and saved.get(k) != config.get(k))
+    if differing:
+        raise ValueError(f"{path} was produced with different settings ({', '.join(differing)}); "
+                         f"use another --results-dir or delete it")
+    if saved['git']['commit'] != config['git']['commit']:
+        print(f"  WARNING: {os.path.basename(path)} comes from commit {saved['git']['commit'][:7]}")
+    if saved['environment']['device'] != config['environment']['device']:
+        print(f"  WARNING: {os.path.basename(path)} was run on {saved['environment']['device']}")
+    return result
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--seeds', type=int, nargs='+', default=SEEDS,
                         help='Random seeds; every configuration is run once per seed')
     parser.add_argument('--rounds', type=int, default=NUM_ROUNDS, help='Number of FL rounds')
+    parser.add_argument('--results-dir', default=RESULTS_DIR,
+                        help='Where per-run JSON files and summary.json are written; runs whose '
+                             'file already exists here are skipped (resume)')
+    parser.add_argument('--plots-dir', default=PLOTS_DIR, help='Where the summary plot is written')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--skip-summary', action='store_true',
+                      help='Only run missing experiments; do not write summary.json or the plot')
+    mode.add_argument('--summary-only', action='store_true',
+                      help='Do not train; build summary.json and the plot from saved runs '
+                           '(fails if any run is missing)')
     return parser.parse_args()
 
 def main():
@@ -342,22 +381,33 @@ def main():
     print("MODEL POISONING ATTACK EXPERIMENT")
     print(f"Clients: {NUM_CLIENTS}, Malicious: {NUM_MALICIOUS}, Rounds: {args.rounds}, "
           f"Seeds: {args.seeds}, Device: {config['environment']['device']}")
+    print(f"Results: {args.results_dir}")
     print("=" * 70)
 
     runs = {spec['name']: [] for spec in CONFIGS}
     for seed in args.seeds:
         for spec in CONFIGS:
-            print(f"\n[seed {seed}] {spec['name']}")
-            result = run_experiment(spec, seed, args.rounds)
+            path = result_path(args.results_dir, seed, spec)
+            if os.path.exists(path):
+                print(f"\n[seed {seed}] {spec['name']}: already done, skipping")
+                result = load_result(path, spec, seed, config)
+            elif args.summary_only:
+                raise FileNotFoundError(f"Missing {path}; run without --summary-only first")
+            else:
+                print(f"\n[seed {seed}] {spec['name']}")
+                result = run_experiment(spec, seed, args.rounds)
+                save_results(path, {'config': config, **result})
             runs[spec['name']].append(result)
-            save_results(os.path.join(RESULTS_DIR, f"seed{seed}_{spec['name']}.json"),
-                         {'config': config, **result})
+
+    if args.skip_summary:
+        print("\n✅ Runs completed (summary skipped)")
+        return
 
     stats = {name: summarise(r) for name, r in runs.items()}
-    save_results(os.path.join(RESULTS_DIR, 'summary.json'), {'config': config, 'summary': stats})
+    save_results(os.path.join(args.results_dir, 'summary.json'), {'config': config, 'summary': stats})
 
-    plot_results(runs, stats)
-    print_summary(stats)
+    plot_results(runs, stats, args.plots_dir)
+    print_summary(stats, args.results_dir, args.plots_dir)
     print("\n✅ Experiment completed successfully!")
 
 if __name__ == "__main__":
