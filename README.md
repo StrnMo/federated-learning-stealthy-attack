@@ -159,7 +159,7 @@ defenses work, not by how well they detect attackers:
 Open [colab/run_experiments.ipynb](colab/run_experiments.ipynb) in Google Colab, select a GPU
 runtime and run all cells. The notebook:
 
-1. mounts Google Drive and clones this repository on branch `fix-pipeline`;
+1. mounts Google Drive and clones this repository on branch `main`;
 2. installs the requirements;
 3. runs a short GPU smoke test (1 seed, 2 rounds) and stops if it fails;
 4. runs the full experiment one seed at a time, saving every run as a JSON file to a Drive
