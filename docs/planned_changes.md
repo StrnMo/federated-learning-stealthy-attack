@@ -35,3 +35,31 @@ defenses actually use.
 
 **Why:** a stealth metric has to be relative to what a defense compares against. This is needed
 for the planned stealthy, class-targeted attack.
+
+## 3. Assign the samples left over by rounding in the Dirichlet partition
+
+**Now:** `create_non_iid_splits` in `utils/data_utils.py` gives each client `int(p_k · n_c)`
+samples of class c. The rounding down leaves 72–82 of the 11,959 training samples (about 0.6%)
+assigned to no client, depending on the seed.
+
+**Planned:** assign the left-over samples as well, for example by splitting each class at the
+rounded cumulative proportions, so that every training sample belongs to exactly one client.
+
+**Why:** all training data should be used; the README currently has to note the unassigned
+samples.
+
+**Affects:** every data partition, and therefore all results. Results produced before and after
+this change must not be mixed (use a new results directory).
+
+## 4. Per-seed dots in paper figures
+
+**Now:** the summary plot shows mean ± std error bars. When the seeds disagree strongly, this
+hides the outcome: for FedAvg at z = 2.0, one seed reaches 0.62 balanced accuracy while the other
+four diverge and count at chance (0.125), but the plot shows only 0.22 ± 0.22.
+
+**Planned:** in the paper figures, show each seed's value as a dot next to the mean, with
+diverged and degenerate runs marked differently.
+
+**Why:** makes bimodal outcomes and broken runs visible at a glance.
+
+**Affects:** figures only; no experiment needs to be rerun.
