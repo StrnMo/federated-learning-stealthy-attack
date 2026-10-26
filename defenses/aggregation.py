@@ -7,20 +7,26 @@ import copy
 import torch
 import numpy as np
 
-def fedavg_aggregate(client_weights):
-    """Standard Federated Averaging"""
+def fedavg_aggregate(client_weights, num_samples=None):
+    """
+    Federated Averaging (McMahan et al. 2017): mean weighted by n_k / sum(n).
+    Without num_samples every client gets equal weight.
+    """
     if not client_weights:
         return None
-    
+    if num_samples is None:
+        num_samples = [1] * len(client_weights)
+    if len(num_samples) != len(client_weights):
+        raise ValueError("num_samples must have one entry per client")
+    total = float(sum(num_samples))
+    coeffs = [n / total for n in num_samples]
+
     avg = copy.deepcopy(client_weights[0])
     for key in avg.keys():
         if avg[key].dtype == torch.long:
             continue
         # Convert to float for accumulation
-        avg[key] = avg[key].float()
-        for w in client_weights[1:]:
-            avg[key] += w[key].float()
-        avg[key] = avg[key] / len(client_weights)
+        avg[key] = sum(c * w[key].float() for c, w in zip(coeffs, client_weights))
     return avg
 
 def trimmed_mean_aggregate(client_weights, trim_ratio=0.2):
@@ -63,54 +69,96 @@ def trimmed_mean_aggregate(client_weights, trim_ratio=0.2):
     
     return avg_weights
 
-def krum_aggregate(client_weights, num_malicious=1):
+def krum_scores(client_weights, num_malicious):
     """
-    Krum - selects the update most consistent with neighbors.
-    FIXED: Proper distance computation and selection
+    Krum scores (Blanchard et al. 2017): for each client, the sum of SQUARED
+    Euclidean distances to its n - f - 2 nearest other clients.
+    Distances between full weight vectors equal distances between updates,
+    since every client starts from the same global model.
     """
-    if not client_weights:
-        return None
-    
     num_clients = len(client_weights)
-    
-    # For small number of clients, fallback to trimmed mean
     if num_clients <= 2 * num_malicious + 2:
-        print(f"    Krum fallback: using Trimmed Mean (only {num_clients} clients)")
-        return trimmed_mean_aggregate(client_weights)
-    
-    def compute_distance(w1, w2):
-        """Compute Euclidean distance between two model updates"""
+        raise ValueError(f"Krum needs n > 2f + 2 (got n={num_clients}, f={num_malicious})")
+
+    def squared_distance(w1, w2):
         total = 0.0
         for key in w1.keys():
             if w1[key].dtype == torch.long:
                 continue
-            diff = w1[key].float() - w2[key].float()
-            total += torch.norm(diff).item() ** 2
-        return total ** 0.5
-    
-    # Compute pairwise distances
-    distances = np.zeros((num_clients, num_clients))
+            total += torch.sum((w1[key].float() - w2[key].float()) ** 2).item()
+        return total
+
+    # Compute pairwise squared distances
+    sq_dists = np.zeros((num_clients, num_clients))
     for i in range(num_clients):
         for j in range(i + 1, num_clients):
-            d = compute_distance(client_weights[i], client_weights[j])
-            distances[i, j] = d
-            distances[j, i] = d
-    
-    # For each client, sum distances to its nearest neighbors
+            d = squared_distance(client_weights[i], client_weights[j])
+            sq_dists[i, j] = d
+            sq_dists[j, i] = d
+
+    # For each client, sum squared distances to its nearest neighbours (excluding itself)
     n_neighbors = num_clients - num_malicious - 2
-    
-    scores = []
-    for i in range(num_clients):
-        # Get distances to all other clients
-        dists = distances[i]
-        # Sort indices by distance
-        sorted_indices = np.argsort(dists)
-        # Sum distances to n_neighbors closest (excluding self)
-        neighbor_sum = np.sum(dists[sorted_indices[1:n_neighbors + 1]])
-        scores.append(neighbor_sum)
-    
-    # Select client with smallest score
-    best_idx = np.argmin(scores)
-    
-    print(f"    Krum selected client {best_idx} out of {num_clients}")
+    return np.array([np.sort(np.delete(sq_dists[i], i))[:n_neighbors].sum()
+                     for i in range(num_clients)])
+
+def krum_aggregate(client_weights, num_malicious=1):
+    """Krum - selects the single update with the lowest Krum score"""
+    if not client_weights:
+        return None
+    best_idx = int(np.argmin(krum_scores(client_weights, num_malicious)))
     return copy.deepcopy(client_weights[best_idx])
+
+def multi_krum_select(client_weights, num_malicious, m=None):
+    """
+    Multi-Krum selection (Blanchard et al. 2017): the m clients with the lowest
+    Krum scores, default m = n - f. Returns their positions in ascending order.
+    """
+    num_clients = len(client_weights)
+    m = num_clients - num_malicious if m is None else m
+    if not 1 <= m <= num_clients:
+        raise ValueError(f"Multi-Krum needs 1 <= m <= n (got m={m}, n={num_clients})")
+    scores = krum_scores(client_weights, num_malicious)
+    return sorted(int(i) for i in np.argsort(scores, kind='stable')[:m])
+
+def multi_krum_aggregate(client_weights, num_malicious=1, m=None):
+    """Multi-Krum - unweighted mean of the m selected updates, as in the original paper"""
+    if not client_weights:
+        return None
+    kept = multi_krum_select(client_weights, num_malicious, m)
+    return fedavg_aggregate([client_weights[i] for i in kept])
+
+# ---------- Uniform interface used by the experiment runner ----------
+# Each defense takes (client_weights, num_samples, num_malicious, **params) and returns
+# (aggregate, accepted): accepted lists the client positions the defense kept, or is None
+# for defenses that do not select or remove whole clients.
+
+def _fedavg(client_weights, num_samples, num_malicious):
+    return fedavg_aggregate(client_weights, num_samples), None
+
+def _trimmed_mean(client_weights, num_samples, num_malicious, trim_ratio=0.2):
+    # Coordinate-wise: no client is removed as a whole
+    return trimmed_mean_aggregate(client_weights, trim_ratio), None
+
+def _krum(client_weights, num_samples, num_malicious, f=None):
+    # f is the defender's assumed number of attackers; defaults to the true number
+    f = num_malicious if f is None else f
+    best_idx = int(np.argmin(krum_scores(client_weights, f)))
+    return copy.deepcopy(client_weights[best_idx]), [best_idx]
+
+def _multi_krum(client_weights, num_samples, num_malicious, f=None, m=None):
+    f = num_malicious if f is None else f
+    kept = multi_krum_select(client_weights, f, m)
+    return fedavg_aggregate([client_weights[i] for i in kept]), kept
+
+DEFENSES = {
+    'fedavg': _fedavg,
+    'trimmed_mean': _trimmed_mean,
+    'krum': _krum,
+    'multi_krum': _multi_krum,
+}
+
+def aggregate(name, client_weights, num_samples, num_malicious, **params):
+    """Aggregate with the named defense; returns (aggregate, accepted client positions or None)"""
+    if name not in DEFENSES:
+        raise ValueError(f"Unknown defense '{name}' (known: {sorted(DEFENSES)})")
+    return DEFENSES[name](client_weights, num_samples, num_malicious, **params)

@@ -10,7 +10,8 @@ from torch.utils.data import DataLoader, Subset
 from medmnist import BloodMNIST, INFO
 
 # Configuration
-DATA_ROOT = 'C:/Users/ASUS/.medmnist'
+DATA_ROOT = os.environ.get('MEDMNIST_ROOT', os.path.expanduser('~/.medmnist'))
+# GPU when available, otherwise CPU
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 BATCH_SIZE = 32
 
@@ -38,18 +39,25 @@ class TransformedBloodMNIST(BloodMNIST):
 
 class FLClient:
     """Federated Learning client with local training"""
-    def __init__(self, client_id, dataset, model, device, batch_size=32, local_epochs=2):
+    def __init__(self, client_id, dataset, model, device, batch_size=32, local_epochs=2, seed=None,
+                 lr=0.01, momentum=0.9):
         self.client_id = client_id
         self.has_data = len(dataset) > 0
+        self.num_samples = len(dataset)
         self.device = device
         self.local_epochs = local_epochs
-        
+        self.lr = lr
+        self.momentum = momentum
+
         if not self.has_data:
             return
-            
+
         self.model = copy.deepcopy(model).to(device)
-        self.dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=0.001)
+        # Per-client generator so the shuffling order depends only on the seed
+        generator = torch.Generator().manual_seed(seed) if seed is not None else None
+        self.dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True,
+                                     generator=generator)
+        self.optimizer = None
         self.criterion = torch.nn.CrossEntropyLoss()
         
     def set_weights(self, weights):
@@ -66,7 +74,9 @@ class FLClient:
         """Perform local training and return updated weights"""
         if not self.has_data:
             return None
-            
+
+        # Fresh optimizer each round: no momentum carried over from a previous global model
+        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr, momentum=self.momentum)
         self.model.train()
         for epoch in range(self.local_epochs):
             for images, labels in self.dataloader:
@@ -82,26 +92,45 @@ class FLClient:
         return self.get_weights()
 
 def load_data():
-    """Load BloodMNIST dataset"""
+    """
+    Load BloodMNIST with its official splits. The validation split is for
+    monitoring and tuning; the test split should be evaluated once, at the end.
+    """
     print("Loading BloodMNIST dataset...")
     train_data = TransformedBloodMNIST(split='train', download=True, size=28)
+    val_data = TransformedBloodMNIST(split='val', download=True, size=28)
     test_data = TransformedBloodMNIST(split='test', download=True, size=28)
+    val_loader = DataLoader(val_data, batch_size=BATCH_SIZE)
     test_loader = DataLoader(test_data, batch_size=BATCH_SIZE)
     num_classes = len(INFO['bloodmnist']['label'])
-    print(f"  Training samples: {len(train_data)}, Classes: {num_classes}")
-    return train_data, test_loader, num_classes
+    print(f"  Training samples: {len(train_data)}, Validation: {len(val_data)}, "
+          f"Test: {len(test_data)}, Classes: {num_classes}")
+    return train_data, val_loader, test_loader, num_classes
 
-def create_non_iid_splits(dataset, num_clients, alpha=0.5, min_samples=30):
+def partition_data(dataset, num_clients, partition, rng):
+    """
+    Split a dataset across clients according to a partition spec, e.g.
+    {'type': 'dirichlet', 'alpha': 0.5, 'min_samples': 30}.
+    """
+    if partition['type'] == 'dirichlet':
+        return create_non_iid_splits(dataset, num_clients, alpha=partition['alpha'],
+                                     min_samples=partition['min_samples'], rng=rng)
+    raise ValueError(f"Unknown partition type '{partition['type']}'")
+
+def create_non_iid_splits(dataset, num_clients, alpha=0.5, min_samples=30, rng=None):
     """
     Create non-IID client splits using Dirichlet distribution.
-    
+
     Args:
         dataset: Training dataset
         num_clients: Number of clients
         alpha: Dirichlet concentration parameter (smaller = more non-IID)
         min_samples: Minimum samples per client
+        rng: NumPy Generator used for all sampling (pass a seeded one for reproducibility)
     """
     print("  Creating non-IID client splits...")
+    if rng is None:
+        rng = np.random.default_rng()
     
     # Extract labels
     labels = []
@@ -119,9 +148,9 @@ def create_non_iid_splits(dataset, num_clients, alpha=0.5, min_samples=30):
         client_indices = [[] for _ in range(num_clients)]
         
         for class_id in range(num_classes):
-            proportions = np.random.dirichlet([current_alpha] * num_clients)
+            proportions = rng.dirichlet([current_alpha] * num_clients)
             class_samples = class_indices[class_id].copy()
-            np.random.shuffle(class_samples)
+            rng.shuffle(class_samples)
             start = 0
             for client_id, prop in enumerate(proportions):
                 n = int(prop * len(class_samples))
